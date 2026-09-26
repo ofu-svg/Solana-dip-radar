@@ -293,6 +293,13 @@ def get_ohlcv(pool_address: str) -> list[list[Any]]:
     )
     return ((payload.get("data") or {}).get("attributes") or {}).get("ohlcv_list", [])
 
+def get_recent_ohlcv(pool_address: str) -> list[list[Any]]:
+    payload = get_json(
+        f"/networks/{NETWORK}/pools/{quote(pool_address, safe='')}/ohlcv/hour",
+        {"aggregate": 1, "limit": 12, "currency": "usd", "token": "base"},
+    )
+    return ((payload.get("data") or {}).get("attributes") or {}).get("ohlcv_list", [])
+
 
 def get_token_symbol_and_security(token_address: str) -> tuple[str, dict[str, Any]]:
     try:
