@@ -547,54 +547,499 @@ def passes_filters(p: dict[str, Any]) -> tuple[bool, str]:
 
 def scan():
     conn = init_db()
+
     print(f"[{datetime.now().isoformat(timespec='seconds')}] scanning Solana...")
+
     pools = candidate_pools()
     print(f"Candidates: {len(pools)}")
 
+    def pct_change(new_price, old_price):
+        if not new_price or not old_price or old_price <= 0:
+            return None
+        return ((new_price - old_price) / old_price) * 100.0
+
+    def get_15m_ohlcv(pool_address):
+        payload = get_json(
+            f"/networks/{NETWORK}/pools/{quote(pool_address, safe='')}/ohlcv/minute",
+            {
+                "aggregate": 15,
+                "limit": 97,
+                "currency": "usd",
+                "token": "base",
+            },
+        )
+
+        raw = ((payload.get("data") or {}).get("attributes") or {}).get(
+            "ohlcv_list", []
+        )
+
+        rows = []
+
+        for row in raw:
+            if not isinstance(row, (list, tuple)) or len(row) < 5:
+                continue
+
+            try:
+                ts = int(float(row[0]))
+            except Exception:
+                continue
+
+            close_price = safe_float(row[4])
+
+            if close_price and close_price > 0:
+                rows.append((ts, close_price))
+
+        rows.sort(key=lambda x: x[0])
+
+        return rows
+
+    def nearest_change(rows, target_seconds, min_seconds, max_seconds):
+        if len(rows) < 2:
+            return None
+
+        latest_ts, latest_price = rows[-1]
+
+        possible = []
+
+        for ts, price in rows[:-1]:
+            elapsed = latest_ts - ts
+
+            if min_seconds <= elapsed <= max_seconds:
+                change = pct_change(latest_price, price)
+
+                if change is not None:
+                    possible.append(
+                        (
+                            abs(elapsed - target_seconds),
+                            change,
+                            elapsed,
+                        )
+                    )
+
+        if not possible:
+            return None
+
+        possible.sort(key=lambda x: x[0])
+
+        _, change, elapsed = possible[0]
+
+        return change, elapsed
+
+    def best_change_between(rows, min_seconds, max_seconds, want="down"):
+        if len(rows) < 2:
+            return None
+
+        latest_ts, latest_price = rows[-1]
+
+        best = None
+
+        for ts, price in rows[:-1]:
+            elapsed = latest_ts - ts
+
+            if not (min_seconds <= elapsed <= max_seconds):
+                continue
+
+            change = pct_change(latest_price, price)
+
+            if change is None:
+                continue
+
+            if best is None:
+                best = (change, elapsed)
+                continue
+
+            if want == "down" and change < best[0]:
+                best = (change, elapsed)
+
+            if want == "up" and change > best[0]:
+                best = (change, elapsed)
+
+        return best
+
+    def format_window(seconds):
+        minutes = max(1, int(round(seconds / 60)))
+
+        if minutes < 60:
+            return f"{minutes}m"
+
+        hours = minutes // 60
+        remaining_minutes = minutes % 60
+
+        if hours < 24:
+            if remaining_minutes:
+                return f"{hours}h {remaining_minutes}m"
+            return f"{hours}h"
+
+        return "24h"
+
     for i, p in enumerate(pools, 1):
+
         ok, why = passes_filters(p)
+
         if not ok:
-            print(f"[{i}] skip {p['pool_address'][:8]}... {why}")
+            print(
+                f"[{i:02d}] SKIP {p.get('name') or p.get('symbol') or 'unknown'}: {why}"
+            )
             continue
 
         try:
-            candles = get_ohlcv(p["pool_address"])
-          
-        recent_candles = get_recent_ohlcv(p["pool_address"])
-        if len(recent_candles) >= 6:
-            old_price = safe_float(recent_candles[-1][4])
-            recent_price = safe_float(recent_candles[0][4])
-            if old_price and recent_price and recent_price > old_price * 1.05:
+            pool_address = p["pool_address"]
+
+            candles = get_15m_ohlcv(pool_address)
+
+            if len(candles) < 5:
+                print(
+                    f"[{i:02d}] {p.get('name') or 'unknown'}: "
+                    f"not enough 15m candles"
+                )
                 continue
 
-        ath, ath_ts = calculate_ath(candles)
+            latest_ts, latest_price = candles[-1]
 
-            dd = drawdown_percent(p["price"], ath)
-            threshold = threshold_for(dd)
-
-            symbol, security = get_token_symbol_and_security(p["token_address"]) if p["token_address"] else ("", {})
-            alert = threshold is not None and should_alert(conn, p["pool_address"], threshold)
-
-            update_pool(conn, p, symbol, ath, ath_ts, dd, threshold, alert)
-
-            print(
-                f"[{i}] {symbol or p['name'][:20]:20} "
-                f"price={fmt_usd(p['price']):>12} "
-                f"dd={dd:6.2f}% liq={fmt_usd(p['liquidity']):>10} "
-                f"vol={fmt_usd(p['volume_24h']):>10}"
+            # ---------------------------------------------------------
+            # EXACT 15-MINUTE MOVEMENT
+            # ---------------------------------------------------------
+            change_15m = nearest_change(
+                candles,
+                target_seconds=15 * 60,
+                min_seconds=10 * 60,
+                max_seconds=25 * 60,
             )
 
-            if alert:
-                msg = build_message(p, symbol, ath, dd, threshold, security)
-                sent = send_telegram(msg)
-                # Even if Telegram isn't configured, don't repeatedly print the
-                # same alert every scan: mark it as alerted after displaying it.
-                if not sent and TELEGRAM_BOT_TOKEN:
-                    print("[WARN] alert could not be sent.")
-        except Exception as e:
-            print(f"[WARN] {p['pool_address'][:8]}... {e}")
+            # ---------------------------------------------------------
+            # APPROXIMATE 1-HOUR MOVEMENT
+            # ---------------------------------------------------------
+            change_1h = nearest_change(
+                candles,
+                target_seconds=60 * 60,
+                min_seconds=45 * 60,
+                max_seconds=90 * 60,
+            )
 
-        # Be gentle with the public API.
+            # ---------------------------------------------------------
+            # BEST DOWNWARD MOVE BETWEEN 1 HOUR AND 24 HOURS
+            # ---------------------------------------------------------
+            best_down = best_change_between(
+                candles,
+                min_seconds=60 * 60,
+                max_seconds=24 * 60 * 60,
+                want="down",
+            )
+
+            # ---------------------------------------------------------
+            # BEST UPWARD MOVE BETWEEN 15 MINUTES AND 24 HOURS
+            # ---------------------------------------------------------
+            upward_candidates = []
+
+            if change_15m:
+                upward_candidates.append(change_15m)
+
+            if change_1h:
+                upward_candidates.append(change_1h)
+
+            best_up_1_24 = best_change_between(
+                candles,
+                min_seconds=60 * 60,
+                max_seconds=24 * 60 * 60,
+                want="up",
+            )
+
+            if best_up_1_24:
+                upward_candidates.append(best_up_1_24)
+
+            best_up = None
+
+            if upward_candidates:
+                best_up = max(
+                    upward_candidates,
+                    key=lambda x: x[0],
+                )
+
+            # ---------------------------------------------------------
+            # CRASH SIGNALS
+            # ---------------------------------------------------------
+            crash_candidates = []
+
+            # -30% or worse in approximately 15 minutes
+            if change_15m and change_15m[0] <= -30.0:
+                crash_candidates.append(
+                    ("15m", change_15m)
+                )
+
+            # -30% or worse in approximately 1 hour
+            if change_1h and change_1h[0] <= -30.0:
+                crash_candidates.append(
+                    ("1h", change_1h)
+                )
+
+            # -45% or worse between 1 and 24 hours
+            if best_down and best_down[0] <= -45.0:
+                crash_candidates.append(
+                    (
+                        format_window(best_down[1]),
+                        best_down,
+                    )
+                )
+
+            best_crash = None
+
+            if crash_candidates:
+                best_crash = min(
+                    crash_candidates,
+                    key=lambda x: x[1][0],
+                )
+
+            # ---------------------------------------------------------
+            # UPWARD SIGNAL
+            # ---------------------------------------------------------
+            pump_signal = None
+
+            if best_up and best_up[0] >= 100.0:
+                pump_signal = best_up
+
+            # Nothing extreme happened -> NO TELEGRAM ALERT
+            if not best_crash and not pump_signal:
+                print(
+                    f"[{i:02d}] "
+                    f"{p.get('name') or 'unknown'} "
+                    f"15m={change_15m[0]:+.2f}% "
+                    f"1h={change_1h[0]:+.2f}% "
+                    f"no alert"
+                    if change_15m and change_1h
+                    else f"[{i:02d}] {p.get('name') or 'unknown'} no alert"
+                )
+
+                time.sleep(0.8)
+                continue
+
+            # ---------------------------------------------------------
+            # DETERMINE CRASH ALERT LEVEL
+            # ---------------------------------------------------------
+            crash_level = None
+
+            if best_crash:
+                drop = best_crash[1][0]
+
+                if drop <= -99.0:
+                    crash_level = "CRASH_99"
+                elif drop <= -60.0:
+                    crash_level = "CRASH_60"
+                elif drop <= -50.0:
+                    crash_level = "CRASH_50"
+                elif drop <= -45.0:
+                    crash_level = "CRASH_45"
+                else:
+                    crash_level = "CRASH_30"
+
+            # ---------------------------------------------------------
+            # DETERMINE PUMP ALERT LEVEL
+            # ---------------------------------------------------------
+            pump_level = None
+
+            if pump_signal:
+                rise = pump_signal[0]
+
+                if rise >= 1000.0:
+                    pump_level = "PUMP_1000"
+                elif rise >= 200.0:
+                    pump_level = "PUMP_200"
+                else:
+                    pump_level = "PUMP_100"
+
+            alert_parts = []
+
+            if crash_level:
+                alert_parts.append(crash_level)
+
+            if pump_level:
+                alert_parts.append(pump_level)
+
+            alert_key = "|".join(alert_parts)
+
+            # ---------------------------------------------------------
+            # GET TOKEN INFORMATION ONLY WHEN THERE IS A REAL SIGNAL
+            # ---------------------------------------------------------
+            symbol, security = get_token_symbol_and_security(
+                p.get("token_address")
+            )
+
+            symbol = symbol or p.get("name") or p.get("symbol") or "UNKNOWN"
+
+            # ---------------------------------------------------------
+            # KEEP DATABASE/ATH INFORMATION FOR RECORD KEEPING,
+            # BUT ATH IS NOT USED TO TRIGGER THE ALERT.
+            # ---------------------------------------------------------
+            ath = 0.0
+            ath_ts = 0
+
+            try:
+                daily_candles = get_ohlcv(pool_address)
+
+                if daily_candles:
+                    ath, ath_ts = calculate_ath(daily_candles)
+
+            except Exception as e:
+                print(
+                    f"[WARN] Could not calculate ATH for {symbol}: {e}"
+                )
+
+            dd = 0.0
+
+            try:
+                if ath and p.get("price"):
+                    dd = drawdown_percent(
+                        p["price"],
+                        ath,
+                    )
+            except Exception:
+                dd = 0.0
+
+            # ---------------------------------------------------------
+            # DATABASE UPDATE / DUPLICATE ALERT PROTECTION
+            # ---------------------------------------------------------
+            update_pool(
+                conn,
+                p,
+                symbol,
+                ath,
+                ath_ts,
+                dd,
+                security,
+            )
+
+            if not should_alert(
+                conn,
+                p,
+                symbol,
+                alert_key,
+            ):
+                print(
+                    f"[{i:02d}] {symbol}: "
+                    f"{alert_key} already alerted"
+                )
+
+                time.sleep(0.8)
+                continue
+
+            # ---------------------------------------------------------
+            # BUILD TELEGRAM ALERT
+            # ---------------------------------------------------------
+            lines = []
+
+            if best_crash and pump_signal:
+                lines.append("🚨 SOLANA EXTREME MOVE ALERT")
+
+            elif best_crash:
+                lines.append("🚨 SOLANA CRASH ALERT")
+
+            else:
+                lines.append("🚀 SOLANA EXTREME PUMP ALERT")
+
+            lines.append("")
+            lines.append(f"Token: {symbol}")
+
+            if p.get("token_address"):
+                lines.append(
+                    f"Mint: {p['token_address']}"
+                )
+
+            lines.append(
+                f"Price: {fmt_usd(p.get('price'))}"
+            )
+
+            # ---------------------------------------------------------
+            # CRASH DETAILS
+            # ---------------------------------------------------------
+            if best_crash:
+                crash_window = best_crash[0]
+                crash_change = best_crash[1][0]
+
+                lines.append("")
+                lines.append(
+                    f"📉 CRASH: {crash_change:+.2f}% "
+                    f"in {crash_window}"
+                )
+
+                if change_15m:
+                    lines.append(
+                        f"15m change: {change_15m[0]:+.2f}%"
+                    )
+
+                if change_1h:
+                    lines.append(
+                        f"1h change: {change_1h[0]:+.2f}%"
+                    )
+
+                if best_down:
+                    lines.append(
+                        f"Best 1h–24h drop: "
+                        f"{best_down[0]:+.2f}% "
+                        f"in {format_window(best_down[1])}"
+                    )
+
+            # ---------------------------------------------------------
+            # PUMP DETAILS
+            # ---------------------------------------------------------
+            if pump_signal:
+                pump_change = pump_signal[0]
+                pump_window = format_window(pump_signal[1])
+
+                lines.append("")
+                lines.append(
+                    f"🚀 PUMP: {pump_change:+.2f}% "
+                    f"in {pump_window}"
+                )
+
+                if change_15m:
+                    lines.append(
+                        f"15m change: {change_15m[0]:+.2f}%"
+                    )
+
+                if change_1h:
+                    lines.append(
+                        f"1h change: {change_1h[0]:+.2f}%"
+                    )
+
+            # ---------------------------------------------------------
+            # MARKET SAFETY INFORMATION
+            # ---------------------------------------------------------
+            lines.append("")
+            lines.append(
+                f"Liquidity: {fmt_usd(p.get('liquidity'))}"
+            )
+
+            lines.append(
+                f"24h Volume: {fmt_usd(p.get('volume_24h'))}"
+            )
+
+            lines.append(
+                f"24h Transactions: {p.get('tx_24h', 0)}"
+            )
+
+            lines.append("")
+            lines.append("⚠️ Movement alert only — investigate liquidity before buying.")
+
+            msg = "\n".join(lines)
+
+            sent = send_telegram(msg)
+
+            if sent:
+                print(
+                    f"[{i:02d}] 🚨 ALERT SENT: "
+                    f"{symbol} | {alert_key}"
+                )
+            else:
+                print(
+                    f"[{i:02d}] [WARN] "
+                    f"Telegram alert could not be sent."
+                )
+
+        except Exception as e:
+            print(
+                f"[{i:02d}] ERROR "
+                f"{p.get('name') or p.get('symbol') or 'unknown'}: {e}"
+            )
+
         time.sleep(0.8)
 
     conn.close()
