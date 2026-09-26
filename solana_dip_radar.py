@@ -38,7 +38,7 @@ MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H_USD", "30"))
 MIN_TX_24H = int(os.getenv("MIN_TX_24H", "10"))
 MIN_POOL_AGE_HOURS = float(os.getenv("MIN_POOL_AGE_HOURS", "24"))
 MAX_POOL_AGE_DAYS = float(os.getenv("MAX_POOL_AGE_DAYS", "3650"))
-MAX_CANDIDATES_PER_RUN = int(os.getenv("MAX_CANDIDATES_PER_RUN", "12"))
+MAX_CANDIDATES_PER_RUN = int(os.getenv("MAX_CANDIDATES_PER_RUN", "30"))
 PAGES_TOP = int(os.getenv("PAGES_TOP", "2"))
 PAGES_NEW = int(os.getenv("PAGES_NEW", "2"))
 
