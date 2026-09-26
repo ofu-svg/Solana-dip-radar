@@ -33,8 +33,8 @@ NETWORK = "solana"
 DB_PATH = os.getenv("DB_PATH", "dip_radar.sqlite3")
 
 # Scanner controls
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY_USD", "5000"))
-MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H_USD", "500"))
+MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY_USD", "300"))
+MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H_USD", "30"))
 MIN_TX_24H = int(os.getenv("MIN_TX_24H", "10"))
 MIN_POOL_AGE_HOURS = float(os.getenv("MIN_POOL_AGE_HOURS", "24"))
 MAX_POOL_AGE_DAYS = float(os.getenv("MAX_POOL_AGE_DAYS", "3650"))
