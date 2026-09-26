@@ -1,10 +1,6 @@
 name: Solana Dip Radar
 
 on:
-  on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
   schedule:
     - cron: "*/15 * * * *"
