@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-SOLANA DIP RADAR v4 — 48H / 20 VERIFIED POOLS MAX
+SOLANA DIP RADAR v5 — 48H TO 7D / 20 VERIFIED POOLS MAX
 
 Rules:
 - Minimum pool age: 48 hours.
-- No maximum age.
+- Maximum pool age: 7 days.
 - Maximum of 20 fully verified pools are analyzed.
-- Paginate through all Solana pools available from GeckoTerminal.
+- Only selected Solana DEX pool venues are scanned.
+- No all-Solana crawling.
 - Dip alerts: -30% or worse only.
 - Pump alerts: strictly above +100% only.
 - Dev/team holding must be <= 5%.
@@ -54,17 +55,31 @@ REQUIRE_METADATA_IMMUTABLE = (
     os.getenv("REQUIRE_METADATA_IMMUTABLE", "true").lower() == "true"
 )
 
-# 48 hours = 2 days
+# Pool age window: 48 hours through 7 days.
 MIN_POOL_AGE_DAYS = float(os.getenv("MIN_POOL_AGE_DAYS", "2"))
+MAX_POOL_AGE_DAYS = float(os.getenv("MAX_POOL_AGE_DAYS", "7"))
 
-# 0 means no artificial page limit.
-MAX_POOL_PAGES = int(os.getenv("MAX_POOL_PAGES", "0"))  # Discovery only; full analysis is capped at 20
+# Only scan selected real Solana DEX pool venues.
+# Phantom is a wallet/trading interface and DEXTools is an analytics platform,
+# so neither is treated as a pool venue here.
+SOLANA_DEX_IDS = [
+    "raydium",
+    "raydium-clmm",
+    "raydium-launchlab",
+    "meteora",
+    "meteora-dbc",
+    "orca",
+    "pumpswap",
+]
+
+# Keep discovery small enough to avoid the 494-pool crawl that caused 429s.
+DEX_PAGES_PER_SOURCE = int(os.getenv("DEX_PAGES_PER_SOURCE", "3"))
 MAX_VERIFIED_POOLS = 20  # HARD CAP: never fully analyze more than 20 verified pools
 
 # Keep these modest so obvious dust pools are ignored.
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY_USD", "300"))
 MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H_USD", "30"))
-MIN_TX_24H = 3  # At least 10 transactions in 24h
+MIN_TX_24H = int(os.getenv("MIN_TX_24H", "3"))  # At least 3 transactions in 24h
 
 # Alert thresholds
 MIN_DIP_ALERT = 30.0
@@ -75,7 +90,9 @@ EXTREME_DIP_24H = 95.0
 ULTRA_DIP_24H = 99.0
 
 REQUEST_INTERVAL = float(os.getenv("REQUEST_INTERVAL", "6.5"))
-MAX_RETRIES = 3
+MAX_RETRIES = 4
+SOLANA_RPC_INTERVAL = float(os.getenv("SOLANA_RPC_INTERVAL", "1.25"))
+SOLANA_RPC_MAX_RETRIES = 5
 ALERT_COOLDOWN_HOURS = float(os.getenv("ALERT_COOLDOWN_HOURS", "12"))
 
 DB_PATH = os.getenv("DB_PATH", "solana_dip_radar_v3.sqlite3")
@@ -99,6 +116,7 @@ solana_session.headers.update({
 })
 
 _last_gt_request = 0.0
+_last_solana_rpc_request = 0.0
 
 
 # =========================
@@ -176,22 +194,61 @@ def format_duration(seconds: int) -> str:
 # =========================
 
 def solana_rpc(method: str, params: list[Any]) -> Any:
+    global _last_solana_rpc_request
+
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": method,
         "params": params,
     }
-    response = solana_session.post(
-        SOLANA_RPC_URL,
-        json=payload,
-        timeout=30,
-    )
-    response.raise_for_status()
-    data = response.json()
-    if data.get("error"):
-        raise RuntimeError(f"Solana RPC {method}: {data['error']}")
-    return data.get("result")
+
+    for attempt in range(SOLANA_RPC_MAX_RETRIES):
+        wait = SOLANA_RPC_INTERVAL - (
+            time.monotonic() - _last_solana_rpc_request
+        )
+        if wait > 0:
+            time.sleep(wait)
+
+        try:
+            _last_solana_rpc_request = time.monotonic()
+            response = solana_session.post(
+                SOLANA_RPC_URL,
+                json=payload,
+                timeout=30,
+            )
+
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                try:
+                    retry_wait = float(retry_after)
+                except (TypeError, ValueError):
+                    retry_wait = min(30.0, 3.0 * (attempt + 1))
+                retry_wait = max(2.0, min(retry_wait, 60.0))
+                print(
+                    f"[WARN] Solana RPC 429 on {method}. "
+                    f"Waiting {retry_wait:.0f}s..."
+                )
+                time.sleep(retry_wait)
+                continue
+
+            response.raise_for_status()
+            data = response.json()
+            if data.get("error"):
+                raise RuntimeError(f"Solana RPC {method}: {data['error']}")
+            return data.get("result")
+
+        except requests.RequestException as exc:
+            if attempt >= SOLANA_RPC_MAX_RETRIES - 1:
+                raise
+            retry_wait = min(30.0, 2.0 * (attempt + 1))
+            print(
+                f"[WARN] Solana RPC error on {method}: {exc}. "
+                f"Retrying in {retry_wait:.0f}s..."
+            )
+            time.sleep(retry_wait)
+
+    raise RuntimeError(f"Solana RPC {method} failed after retries")
 
 
 def get_mint_info(mint: str) -> dict[str, Any]:
@@ -748,50 +805,70 @@ def discover_all_pools(
 
 
 def discover_candidates() -> list[dict[str, Any]]:
-    print("[INFO] Scanning ALL AVAILABLE Solana NEW POOL pages...")
+    """Discover only pools from selected Solana DEX venues.
 
-    new_pools = discover_all_pools(
-        f"/networks/{NETWORK}/new_pools",
-        {"include": "base_token,quote_token,dex"},
-        "NEW",
+    We deliberately do NOT crawl /new_pools, /pools, or /trending_pools
+    across the entire Solana network. That was the source of the 494-pool
+    crawl and repeated 429 errors.
+    """
+    print(
+        "[INFO] Scanning selected Solana DEX pool sources only: "
+        + ", ".join(SOLANA_DEX_IDS)
     )
-
-    print("[INFO] Scanning ALL AVAILABLE Solana ESTABLISHED POOL pages...")
-
-    established_pools = discover_all_pools(
-        f"/networks/{NETWORK}/pools",
-        {
-            "include": "base_token,quote_token,dex",
-            "sort": "h24_volume_usd_desc",
-        },
-        "ESTABLISHED",
-    )
-
-    print("[INFO] Scanning ALL AVAILABLE Solana TRENDING POOL pages...")
-
-    trending_pools = discover_all_pools(
-        f"/networks/{NETWORK}/trending_pools",
-        {"include": "base_token,quote_token,dex"},
-        "TRENDING",
+    print(
+        f"[INFO] Max {DEX_PAGES_PER_SOURCE} page(s) per DEX; "
+        "no all-Solana pool crawl."
     )
 
     seen = set()
-    selected = []
+    selected: list[dict[str, Any]] = []
 
-    for item in new_pools + established_pools + trending_pools:
-        address = item["pool_address"]
+    for dex_id in SOLANA_DEX_IDS:
+        endpoint = f"/networks/{NETWORK}/dexes/{dex_id}/pools"
+        params = {
+            "include": "base_token,quote_token,dex",
+            "sort": "h24_volume_usd_desc",
+        }
 
-        if not address or address in seen:
-            continue
+        print(f"[INFO] DEX: {dex_id}")
 
-        seen.add(address)
-        selected.append(item)
+        for page in range(1, DEX_PAGES_PER_SOURCE + 1):
+            try:
+                payload = get_json(
+                    endpoint,
+                    {**params, "page": page},
+                )
+            except Exception as exc:
+                print(
+                    f"[WARN] {dex_id}: stopped at page {page}: {exc}"
+                )
+                break
+
+            data = payload.get("data", []) or []
+            if not data:
+                break
+
+            added = 0
+            for item in data:
+                parsed = parse_pool(item, dex_id.upper())
+                address = parsed["pool_address"]
+                if address and address not in seen:
+                    seen.add(address)
+                    selected.append(parsed)
+                    added += 1
+
+            print(
+                f"[INFO] {dex_id}: page {page} "
+                f"({len(data)} pools, {added} new)"
+            )
+
+            if len(data) < 20:
+                break
 
     print(
-        f"[INFO] Total unique Solana pools discovered: "
-        f"{len(selected)}"
+        f"[INFO] Selected DEX pool candidates: {len(selected)} "
+        f"(from {len(SOLANA_DEX_IDS)} DEX sources)"
     )
-
     return selected
 
 
@@ -1230,13 +1307,13 @@ def scan():
 
     print("")
     print("=" * 72)
-    print("SOLANA DIP RADAR v3")
+    print("SOLANA DIP RADAR v5")
     print(f"Started: {started}")
-    print("SOLANA POOLS: PAGINATED DISCOVERY / MAX 20 VERIFIED POOLS ANALYZED")
+    print("SOLANA POOLS: SELECTED DEX SOURCES ONLY / MAX 20 VERIFIED POOLS")
     print("MINIMUM POOL AGE: >= 48 HOURS")
-    print("NO MAXIMUM AGE")
+    print("MAXIMUM POOL AGE: <= 7 DAYS")
     print("MAX VERIFIED POOLS: 20")
-    print("MINIMUM 24H TRANSACTIONS: 10")
+    print(f"MINIMUM 24H TRANSACTIONS: {MIN_TX_24H}")
     print("DEV HOLDING FILTER: <= 5% REQUIRED")
     print("MINT AUTHORITY: MUST BE REVOKED")
     print("METADATA: MUST BE IMMUTABLE")
@@ -1296,6 +1373,14 @@ def scan():
                     f"[{index:04d}] {name} | "
                     f"{p['source_type']} | too new "
                     f"({age_days * 24:.1f}h < 48h)"
+                )
+                continue
+
+            if age_days > MAX_POOL_AGE_DAYS:
+                print(
+                    f"[{index:04d}] {name} | "
+                    f"{p['source_type']} | too old "
+                    f"({age_days:.1f}d > 7d)"
                 )
                 continue
 
