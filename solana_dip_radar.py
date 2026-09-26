@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """
-SOLANA DIP RADAR v2
-- Scans BOTH new and established Solana pools.
-- Only scans tokens/pools at least 7 days old; no maximum age.
-- Prints real 15m and 1h percentage changes.
-- Prints price, liquidity, 24h volume, transactions, pool age and 24h-high drawdown.
-- Uses a slow request gate to stay below GeckoTerminal's public rate limit.
-- Sends Telegram alerts for major crashes / deep dips / extreme pumps.
+SOLANA DIP RADAR v3 — 48H / ALL AVAILABLE POOLS
 
-GeckoTerminal public API is rate-limited, so this version intentionally runs
-more slowly than the old script. That is deliberate: fewer 429 errors and
-more reliable numbers.
+Rules:
+- Minimum pool age: 48 hours.
+- No maximum age.
+- No artificial 30/50/100 candidate cap.
+- Paginate through all Solana pools available from GeckoTerminal.
+- Dip alerts: -30% or worse only.
+- Pump alerts: strictly above +100% only.
+- Dev/team holding must be <= 5%.
+- Mint authority must be revoked (not mintable).
+- Metaplex metadata must be immutable.
+- If a safety check cannot be verified, reject the token.
 """
 
 from __future__ import annotations
 
+import base64
 import os
 import sqlite3
 import time
@@ -25,95 +28,81 @@ from urllib.parse import quote
 import requests
 from dotenv import load_dotenv
 
-# Requires: requests, python-dotenv, solders
-
 load_dotenv()
 
-BASE_URL = os.getenv(
-    "GT_BASE_URL",
-    "https://api.geckoterminal.com/api/v2",
-)
+BASE_URL = os.getenv("GT_BASE_URL", "https://api.geckoterminal.com/api/v2")
 NETWORK = "solana"
 
-# Solana RPC used for mint-authority and metadata/developer checks.
-# You can replace this with a Helius/QuickNode/other RPC URL in .env
-# if the public endpoint is rate-limited.
 SOLANA_RPC_URL = os.getenv(
     "SOLANA_RPC_URL",
     "https://api.mainnet-beta.solana.com",
 ).strip()
 
-# Safety filters requested:
+# =========================
+# USER SAFETY FILTERS
+# =========================
+
 MAX_DEV_HOLDING_PERCENT = float(
     os.getenv("MAX_DEV_HOLDING_PERCENT", "5")
 )
+
 REQUIRE_MINT_AUTHORITY_REVOKED = (
-    os.getenv("REQUIRE_MINT_AUTHORITY_REVOKED", "true").lower()
-    == "true"
+    os.getenv("REQUIRE_MINT_AUTHORITY_REVOKED", "true").lower() == "true"
 )
+
 REQUIRE_METADATA_IMMUTABLE = (
-    os.getenv("REQUIRE_METADATA_IMMUTABLE", "true").lower()
-    == "true"
+    os.getenv("REQUIRE_METADATA_IMMUTABLE", "true").lower() == "true"
 )
 
-# Use a fresh DB by default so the old broken schema cannot interfere.
-DB_PATH = os.getenv("DB_PATH", "solana_dip_radar_v2.sqlite3")
+# 48 hours = 2 days
+MIN_POOL_AGE_DAYS = float(os.getenv("MIN_POOL_AGE_DAYS", "2"))
 
-# -------- SCANNER SETTINGS --------
-# No fixed candidate cap: paginate through every pool page returned by
-# GeckoTerminal, then apply the age/liquidity/volume/security filters.
-# Set MAX_POOL_PAGES in .env only if you deliberately want a cap.
-MAX_POOL_PAGES = int(os.getenv("MAX_POOL_PAGES", "0"))  # 0 = unlimited
+# 0 means no artificial page limit.
+MAX_POOL_PAGES = int(os.getenv("MAX_POOL_PAGES", "0"))
 
+# Keep these modest so obvious dust pools are ignored.
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY_USD", "300"))
 MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H_USD", "30"))
 MIN_TX_24H = int(os.getenv("MIN_TX_24H", "10"))
-MIN_POOL_AGE_DAYS = float(os.getenv("MIN_POOL_AGE_DAYS", "2"))
-
-# IMPORTANT: only pools at least 7 days old are scanned.
-# Very new tokens are intentionally excluded.
-# There is NO maximum-age filter: older established tokens remain eligible.
-
-# GeckoTerminal public API is about 10 calls/minute.
-# 6.5 sec between calls keeps us under that limit.
-REQUEST_INTERVAL = float(os.getenv("REQUEST_INTERVAL", "6.5"))
-MAX_RETRIES = 3
 
 # Alert thresholds
-CRASH_15M = max(30.0, float(os.getenv("CRASH_15M", "30")))
-CRASH_1H = max(30.0, float(os.getenv("CRASH_1H", "30")))
-CRASH_24H = max(30.0, float(os.getenv("CRASH_24H", "45")))
-DEEP_DIP_24H = float(os.getenv("DEEP_DIP_24H", "80"))
-EXTREME_DIP_24H = float(os.getenv("EXTREME_DIP_24H", "95"))
-ULTRA_DIP_24H = float(os.getenv("ULTRA_DIP_24H", "99"))
-MIN_DIP_ALERT = 30.0  # Never report a dip smaller than -30%.
-PUMP_1H = max(100.0001, float(os.getenv("PUMP_1H", "100.0001")))  # Pump alert: >100%
+MIN_DIP_ALERT = 30.0
+PUMP_1H = 100.0001
 
-ALERT_COOLDOWN_HOURS = float(
-    os.getenv("ALERT_COOLDOWN_HOURS", "12")
-)
+DEEP_DIP_24H = 80.0
+EXTREME_DIP_24H = 95.0
+ULTRA_DIP_24H = 99.0
 
-TELEGRAM_BOT_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN", ""
-).strip()
-TELEGRAM_CHAT_ID = os.getenv(
-    "TELEGRAM_CHAT_ID", ""
-).strip()
+REQUEST_INTERVAL = float(os.getenv("REQUEST_INTERVAL", "6.5"))
+MAX_RETRIES = 3
+ALERT_COOLDOWN_HOURS = float(os.getenv("ALERT_COOLDOWN_HOURS", "12"))
+
+DB_PATH = os.getenv("DB_PATH", "solana_dip_radar_v3.sqlite3")
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 HEADERS = {
     "accept": "application/json;version=20230203",
-    "user-agent": "SolanaDipRadar/2.0",
+    "user-agent": "SolanaDipRadar/3.0",
 }
 
 session = requests.Session()
 session.headers.update(HEADERS)
 
+solana_session = requests.Session()
+solana_session.headers.update({
+    "accept": "application/json",
+    "content-type": "application/json",
+    "user-agent": "SolanaDipRadar/3.0",
+})
+
 _last_gt_request = 0.0
 
 
-# ============================================================
-# BASIC HELPERS
-# ============================================================
+# =========================
+# HELPERS
+# =========================
 
 def now_ts() -> int:
     return int(time.time())
@@ -131,7 +120,6 @@ def safe_float(value: Any) -> float | None:
 def parse_time(value: Any) -> int | None:
     if not value:
         return None
-
     try:
         return int(
             datetime.fromisoformat(
@@ -145,75 +133,46 @@ def parse_time(value: Any) -> int | None:
 def fmt_usd(value: float | None) -> str:
     if value is None:
         return "n/a"
-
     if value >= 1000:
         return f"${value:,.0f}"
-
     if value >= 1:
         return f"${value:,.2f}"
-
     if value >= 0.01:
         return f"${value:.6f}".rstrip("0").rstrip(".")
-
     return f"${value:.10f}".rstrip("0").rstrip(".")
 
 
 def pct_change(new_price: float, old_price: float) -> float | None:
-    if (
-        new_price is None
-        or old_price is None
-        or old_price <= 0
-    ):
+    if new_price is None or old_price is None or old_price <= 0:
         return None
-
     return ((new_price - old_price) / old_price) * 100.0
 
 
 def format_age(created_at: int | None) -> str:
     if not created_at:
         return "unknown"
-
     seconds = max(0, now_ts() - created_at)
-
     if seconds < 3600:
         return f"{seconds / 60:.0f}m"
-
     if seconds < 86400:
         return f"{seconds / 3600:.1f}h"
-
     return f"{seconds / 86400:.1f}d"
 
 
 def format_duration(seconds: int) -> str:
     minutes = max(1, int(round(seconds / 60)))
-
     if minutes < 60:
         return f"{minutes}m"
-
     hours = minutes // 60
     rem = minutes % 60
-
     if hours < 24:
         return f"{hours}h" if not rem else f"{hours}h {rem}m"
-
     return f"{hours / 24:.1f}d"
 
 
-# ============================================================
-# SOLANA SAFETY / AUTHORITY CHECKS
-# ============================================================
-
-# These checks are intentionally conservative:
-# if the RPC cannot verify a safety property, the token is rejected
-# rather than being shown as "safe".
-
-solana_session = requests.Session()
-solana_session.headers.update({
-    "accept": "application/json",
-    "content-type": "application/json",
-    "user-agent": "SolanaDipRadar/2.0",
-})
-
+# =========================
+# SOLANA RPC / SAFETY
+# =========================
 
 def solana_rpc(method: str, params: list[Any]) -> Any:
     payload = {
@@ -222,21 +181,15 @@ def solana_rpc(method: str, params: list[Any]) -> Any:
         "method": method,
         "params": params,
     }
-
     response = solana_session.post(
         SOLANA_RPC_URL,
         json=payload,
         timeout=30,
     )
     response.raise_for_status()
-
     data = response.json()
-
     if data.get("error"):
-        raise RuntimeError(
-            f"Solana RPC {method}: {data['error']}"
-        )
-
+        raise RuntimeError(f"Solana RPC {method}: {data['error']}")
     return data.get("result")
 
 
@@ -245,23 +198,15 @@ def get_mint_info(mint: str) -> dict[str, Any]:
         "getAccountInfo",
         [
             mint,
-            {
-                "encoding": "jsonParsed",
-                "commitment": "confirmed",
-            },
+            {"encoding": "jsonParsed", "commitment": "confirmed"},
         ],
     )
 
     value = (result or {}).get("value")
-
     if not value:
         raise RuntimeError("Mint account not found")
 
-    parsed = (
-        value.get("data", {})
-        .get("parsed", {})
-    )
-
+    parsed = value.get("data", {}).get("parsed", {})
     info = parsed.get("info", {})
 
     if parsed.get("type") != "mint":
@@ -275,29 +220,17 @@ def get_mint_info(mint: str) -> dict[str, Any]:
         "freeze_authority": info.get("freezeAuthority"),
         "supply_raw": supply_raw,
         "decimals": decimals,
-        "supply": (
-            supply_raw / (10 ** decimals)
-            if decimals >= 0
-            else 0
-        ),
+        "supply": supply_raw / (10 ** decimals) if decimals >= 0 else 0,
     }
 
 
-def get_token_accounts_for_owner(
-    owner: str,
-    mint: str,
-) -> int:
+def get_token_accounts_for_owner(owner: str, mint: str) -> int:
     result = solana_rpc(
         "getTokenAccountsByOwner",
         [
             owner,
-            {
-                "mint": mint,
-            },
-            {
-                "encoding": "jsonParsed",
-                "commitment": "confirmed",
-            },
+            {"mint": mint},
+            {"encoding": "jsonParsed", "commitment": "confirmed"},
         ],
     )
 
@@ -309,13 +242,11 @@ def get_token_accounts_for_owner(
             .get("data", {})
             .get("parsed", {})
         )
-
         amount = (
             parsed.get("info", {})
             .get("tokenAmount", {})
             .get("amount")
         )
-
         try:
             total_raw += int(amount or 0)
         except (TypeError, ValueError):
@@ -324,188 +255,14 @@ def get_token_accounts_for_owner(
     return total_raw
 
 
-def metadata_pda(mint: str) -> str:
-    """
-    Derive the Metaplex Metadata PDA.
-    Requires solders (included in the requirements below).
-    """
-    from solders.pubkey import Pubkey
-
-    metadata_program = Pubkey.from_string(
-        "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
-    )
-
-    mint_pubkey = Pubkey.from_string(mint)
-
-    pda, _ = Pubkey.find_program_address(
-        [
-            b"metadata",
-            bytes(metadata_program),
-            bytes(mint_pubkey),
-        ],
-        metadata_program,
-    )
-
-    return str(pda)
-
-
-def read_metadata_update_authority_and_mutability(
-    mint: str,
-) -> tuple[str | None, bool | None, list[str]]:
-    """
-    Read Metaplex metadata.
-
-    Returns:
-      (update_authority, is_mutable, creator_addresses)
-
-    If the metadata account cannot be decoded, returns (None, None, []).
-    """
-    try:
-        pda = metadata_pda(mint)
-
-        result = solana_rpc(
-            "getAccountInfo",
-            [
-                pda,
-                {
-                    "encoding": "base64",
-                    "commitment": "confirmed",
-                },
-            ],
-        )
-
-        value = (result or {}).get("value")
-
-        if not value:
-            return None, None, []
-
-        data = value.get("data")
-
-        if (
-            not isinstance(data, list)
-            or len(data) < 1
-        ):
-            return None, None, []
-
-        import base64
-        raw = base64.b64decode(data[0])
-
-        # Metaplex Metadata account layout:
-        # key(1) + update_authority(32) + mint(32) +
-        # name(4+32) + symbol(4+10) + uri(4+200) +
-        # seller_fee(2) + creators option...
-        #
-        # isMutable sits after the creators/collection/uses fields,
-        # so a full borsh decoder is preferable. We use solders/
-        # borsh-construct when available; otherwise fail closed.
-        try:
-            from borsh_construct import (
-                CStruct,
-                U8,
-                U16,
-                U32,
-                Bool,
-                Bytes,
-                Option,
-                Vec,
-            )
-
-            # A compact parser is implemented below instead of depending
-            # on a fragile fixed offset because creators are optional.
-            offset = 0
-
-            # key
-            offset += 1
-
-            update_authority = (
-                base58_encode(raw[offset:offset + 32])
-            )
-            offset += 32
-
-            # mint
-            offset += 32
-
-            def read_borsh_string(buf, pos):
-                length = int.from_bytes(
-                    buf[pos:pos + 4],
-                    "little",
-                )
-                pos += 4
-                value = buf[pos:pos + length]
-                pos += length
-                return value, pos
-
-            _, offset = read_borsh_string(raw, offset)  # name
-            _, offset = read_borsh_string(raw, offset)  # symbol
-            _, offset = read_borsh_string(raw, offset)  # uri
-
-            # seller fee basis points
-            offset += 2
-
-            # creators Option<Vec<Creator>>
-            creators_option = raw[offset]
-            offset += 1
-
-            creator_addresses = []
-
-            if creators_option == 1:
-                creator_count = int.from_bytes(
-                    raw[offset:offset + 4],
-                    "little",
-                )
-                offset += 4
-
-                # Creator = address(32) + verified(1) + share(1)
-                for _ in range(creator_count):
-                    creator_bytes = raw[offset:offset + 32]
-                    offset += 32
-                    creator_addresses.append(
-                        base58_encode(creator_bytes)
-                    )
-
-                    # verified + share
-                    offset += 2
-
-            # collection Option<Collection>
-            collection_option = raw[offset]
-            offset += 1
-
-            if collection_option == 1:
-                # key/discriminator + collection pubkey
-                offset += 1 + 32
-
-            # uses Option<Uses>
-            uses_option = raw[offset]
-            offset += 1
-
-            if uses_option == 1:
-                # use_method(1) + remaining(8) + total(8)
-                offset += 1 + 8 + 8
-
-            # is_mutable
-            is_mutable = bool(raw[offset])
-
-            return update_authority, is_mutable, creator_addresses
-
-        except Exception:
-            return None, None, []
-
-    except Exception:
-        return None, None, []
-
-
 def base58_encode(data: bytes) -> str:
-    alphabet = (
-        "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-    )
-
+    alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
     number = int.from_bytes(data, "big")
 
     if number == 0:
         return "1" if data else ""
 
     chars = []
-
     while number:
         number, remainder = divmod(number, 58)
         chars.append(alphabet[remainder])
@@ -516,44 +273,151 @@ def base58_encode(data: bytes) -> str:
             break
         leading_zeroes += 1
 
-    return (
-        "1" * leading_zeroes
-        + "".join(reversed(chars))
+    return "1" * leading_zeroes + "".join(reversed(chars))
+
+
+def metadata_pda(mint: str) -> str:
+    from solders.pubkey import Pubkey
+
+    metadata_program = Pubkey.from_string(
+        "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
     )
+    mint_pubkey = Pubkey.from_string(mint)
+
+    pda, _ = Pubkey.find_program_address(
+        [
+            b"metadata",
+            bytes(metadata_program),
+            bytes(mint_pubkey),
+        ],
+        metadata_program,
+    )
+    return str(pda)
+
+
+def read_metadata(mint: str) -> tuple[str | None, bool | None, list[str]]:
+    """
+    Returns:
+      update_authority, is_mutable, creator_addresses
+
+    Fail closed if metadata cannot be decoded.
+    """
+    try:
+        pda = metadata_pda(mint)
+
+        result = solana_rpc(
+            "getAccountInfo",
+            [
+                pda,
+                {"encoding": "base64", "commitment": "confirmed"},
+            ],
+        )
+
+        value = (result or {}).get("value")
+        if not value:
+            return None, None, []
+
+        data = value.get("data")
+        if not isinstance(data, list) or not data:
+            return None, None, []
+
+        raw = base64.b64decode(data[0])
+        offset = 0
+
+        if len(raw) < 65:
+            return None, None, []
+
+        offset += 1  # key
+
+        update_authority = base58_encode(raw[offset:offset + 32])
+        offset += 32
+
+        offset += 32  # mint
+
+        def read_borsh_string(buf: bytes, pos: int):
+            if pos + 4 > len(buf):
+                raise ValueError("truncated string length")
+            length = int.from_bytes(buf[pos:pos + 4], "little")
+            pos += 4
+            if pos + length > len(buf):
+                raise ValueError("truncated string")
+            value = buf[pos:pos + length]
+            pos += length
+            return value, pos
+
+        _, offset = read_borsh_string(raw, offset)  # name
+        _, offset = read_borsh_string(raw, offset)  # symbol
+        _, offset = read_borsh_string(raw, offset)  # uri
+
+        offset += 2  # seller fee
+
+        if offset >= len(raw):
+            return None, None, []
+
+        creators_option = raw[offset]
+        offset += 1
+
+        creators = []
+
+        if creators_option == 1:
+            if offset + 4 > len(raw):
+                return None, None, []
+            count = int.from_bytes(raw[offset:offset + 4], "little")
+            offset += 4
+
+            for _ in range(count):
+                if offset + 35 > len(raw):
+                    return None, None, []
+                creators.append(base58_encode(raw[offset:offset + 32]))
+                offset += 35  # pubkey + verified + share
+
+        # collection Option<Collection>
+        if offset >= len(raw):
+            return None, None, []
+        collection_option = raw[offset]
+        offset += 1
+
+        if collection_option == 1:
+            offset += 33  # verified + key
+
+        # uses Option<Uses>
+        if offset >= len(raw):
+            return None, None, []
+        uses_option = raw[offset]
+        offset += 1
+
+        if uses_option == 1:
+            offset += 17  # use_method + remaining + total
+
+        if offset >= len(raw):
+            return None, None, []
+
+        is_mutable = bool(raw[offset])
+
+        return update_authority, is_mutable, creators
+
+    except Exception:
+        return None, None, []
 
 
 def get_dev_holding_percent(
     mint: str,
     mint_info: dict[str, Any],
     update_authority: str | None,
-    creator_addresses: list[str] | None,
+    creator_addresses: list[str],
 ) -> float | None:
-    """
-    Conservative developer/team holding estimate.
 
-    We inspect the Metaplex creator addresses and the metadata update
-    authority, then sum any token balance held directly by those wallets.
-
-    Only tokens that pass the configured creator/update-authority
-    holding threshold are allowed through this filter.
-    """
-    supply_raw = int(
-        mint_info.get("supply_raw", 0)
-    )
-
+    supply_raw = int(mint_info.get("supply_raw", 0))
     if supply_raw <= 0:
         return None
 
     owners = []
 
-    for owner in (creator_addresses or []):
+    for owner in creator_addresses:
         if owner and owner not in owners:
             owners.append(owner)
 
-    if (
-        update_authority
-        and update_authority not in owners
-    ):
+    if update_authority and update_authority not in owners:
         owners.append(update_authority)
 
     if not owners:
@@ -563,109 +427,65 @@ def get_dev_holding_percent(
 
     for owner in owners:
         try:
-            total_raw += get_token_accounts_for_owner(
-                owner,
-                mint,
-            )
+            total_raw += get_token_accounts_for_owner(owner, mint)
         except Exception:
-            # If any creator balance cannot be checked, fail closed.
             return None
 
-    return (
-        total_raw
-        / supply_raw
-        * 100.0
-    )
+    return total_raw / supply_raw * 100.0
 
 
-def safety_check_token(
-    mint: str,
-) -> tuple[bool, dict[str, Any], str]:
-    """
-    Returns:
-      (passes, details, reason)
-
-    Fail closed:
-    - mint authority must be revoked
-    - metadata must be immutable
-    - dev/update-authority holdings must be <=5%
-    - unknown verification => reject
-    """
-    details = {}
+def safety_check_token(mint: str) -> tuple[bool, dict[str, Any], str]:
+    details: dict[str, Any] = {}
 
     try:
         mint_info = get_mint_info(mint)
-        details["mint_authority"] = mint_info.get(
-            "mint_authority"
-        )
-        details["freeze_authority"] = mint_info.get(
-            "freeze_authority"
-        )
+
+        details["mint_authority"] = mint_info.get("mint_authority")
+        details["freeze_authority"] = mint_info.get("freeze_authority")
         details["supply"] = mint_info.get("supply")
 
         if REQUIRE_MINT_AUTHORITY_REVOKED:
             if mint_info.get("mint_authority") is not None:
-                return (
-                    False,
-                    details,
-                    "mintable (mint authority active)",
-                )
+                return False, details, "mintable (mint authority active)"
 
-        update_authority, is_mutable, creator_addresses = (
-            read_metadata_update_authority_and_mutability(
-                mint
-            )
-        )
+        update_authority, is_mutable, creators = read_metadata(mint)
 
         details["update_authority"] = update_authority
         details["metadata_mutable"] = is_mutable
-        details["creator_addresses"] = creator_addresses
+        details["creator_addresses"] = creators
 
         if REQUIRE_METADATA_IMMUTABLE:
             if is_mutable is not False:
-                return (
-                    False,
-                    details,
-                    "metadata mutable or unverified",
-                )
+                return False, details, "metadata mutable or unverified"
 
         dev_pct = get_dev_holding_percent(
             mint,
             mint_info,
             update_authority,
-            creator_addresses,
+            creators,
         )
 
         details["dev_holding_percent"] = dev_pct
 
         if dev_pct is None:
-            return (
-                False,
-                details,
-                "dev holdings unverified",
-            )
+            return False, details, "dev holdings unverified"
 
         if dev_pct > MAX_DEV_HOLDING_PERCENT:
             return (
                 False,
                 details,
-                f"dev holds {dev_pct:.2f}% > "
-                f"{MAX_DEV_HOLDING_PERCENT:.2f}%",
+                f"dev holds {dev_pct:.2f}% > {MAX_DEV_HOLDING_PERCENT:.2f}%",
             )
 
         return True, details, "passed"
 
     except Exception as exc:
-        return (
-            False,
-            details,
-            f"safety check error: {exc}",
-        )
+        return False, details, f"safety check error: {exc}"
 
 
-# ============================================================
+# =========================
 # DATABASE
-# ============================================================
+# =========================
 
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
@@ -713,10 +533,7 @@ def init_db() -> sqlite3.Connection:
     return conn
 
 
-def previous_alert(
-    conn: sqlite3.Connection,
-    pool_address: str,
-) -> tuple[str | None, int | None]:
+def previous_alert(conn, pool_address: str):
     row = conn.execute(
         """
         SELECT last_alert_key, last_alert_ts
@@ -726,17 +543,10 @@ def previous_alert(
         (pool_address,),
     ).fetchone()
 
-    if not row:
-        return None, None
-
-    return row[0], row[1]
+    return (row[0], row[1]) if row else (None, None)
 
 
-def alert_allowed(
-    conn: sqlite3.Connection,
-    pool_address: str,
-    alert_key: str,
-) -> bool:
+def alert_allowed(conn, pool_address: str, alert_key: str) -> bool:
     old_key, old_ts = previous_alert(conn, pool_address)
 
     if not old_key or not old_ts:
@@ -745,28 +555,19 @@ def alert_allowed(
     if old_key != alert_key:
         return True
 
-    return (
-        now_ts() - int(old_ts)
-        >= ALERT_COOLDOWN_HOURS * 3600
-    )
+    return now_ts() - int(old_ts) >= ALERT_COOLDOWN_HOURS * 3600
 
 
-# ============================================================
-# GECKOTERMINAL REQUESTS
-# ============================================================
+# =========================
+# GECKOTERMINAL
+# =========================
 
-def get_json(
-    path: str,
-    params: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-
+def get_json(path: str, params: dict[str, Any] | None = None):
     global _last_gt_request
 
     url = f"{BASE_URL}{path}"
 
     for attempt in range(MAX_RETRIES):
-
-        # Hard request gate.
         wait = REQUEST_INTERVAL - (
             time.monotonic() - _last_gt_request
         )
@@ -784,10 +585,7 @@ def get_json(
             )
 
             if response.status_code == 429:
-                retry_after = response.headers.get(
-                    "Retry-After"
-                )
-
+                retry_after = response.headers.get("Retry-After")
                 try:
                     retry_wait = float(retry_after)
                 except (TypeError, ValueError):
@@ -799,7 +597,6 @@ def get_json(
                     f"[WARN] GeckoTerminal 429. "
                     f"Waiting {retry_wait:.0f}s..."
                 )
-
                 time.sleep(retry_wait)
                 continue
 
@@ -811,155 +608,16 @@ def get_json(
                 raise
 
             retry_wait = 10.0 * (attempt + 1)
-
             print(
                 f"[WARN] API error: {exc}. "
                 f"Retrying in {retry_wait:.0f}s..."
             )
-
             time.sleep(retry_wait)
 
-    raise RuntimeError(
-        "GeckoTerminal request failed."
-    )
+    raise RuntimeError("GeckoTerminal request failed")
 
 
-# ============================================================
-# POOL DISCOVERY
-# ============================================================
-
-def pool_list(
-    endpoint: str,
-    params: dict[str, Any] | None = None,
-    pages: int = 1,
-) -> list[dict[str, Any]]:
-
-    results = []
-
-    for page in range(1, pages + 1):
-
-        query = dict(params or {})
-        query["page"] = page
-
-        try:
-            payload = get_json(
-                endpoint,
-                query,
-            )
-
-            results.extend(
-                payload.get("data", []) or []
-            )
-
-        except Exception as exc:
-            print(
-                f"[WARN] Pool list {endpoint} "
-                f"page {page}: {exc}"
-            )
-            break
-
-    return results
-
-
-def parse_pool(
-    item: dict[str, Any],
-    source_type: str,
-) -> dict[str, Any]:
-
-    attributes = (
-        item.get("attributes") or {}
-    )
-
-    relationships = (
-        item.get("relationships") or {}
-    )
-
-    pool_id = item.get("id", "")
-
-    address = (
-        attributes.get("address")
-        or pool_id.split("_", 1)[-1]
-    )
-
-    base_data = (
-        relationships.get("base_token", {})
-        .get("data")
-        or {}
-    )
-
-    quote_data = (
-        relationships.get("quote_token", {})
-        .get("data")
-        or {}
-    )
-
-    dex_data = (
-        relationships.get("dex", {})
-        .get("data")
-        or {}
-    )
-
-    base_id = base_data.get("id") or ""
-    quote_id = quote_data.get("id") or ""
-
-    token_address = (
-        base_id.split("_", 1)[1]
-        if "_" in base_id
-        else None
-    )
-
-    tx = attributes.get("transactions") or {}
-    volume = attributes.get("volume_usd") or {}
-    changes = (
-        attributes.get("price_change_percentage")
-        or {}
-    )
-
-    pool_name = (
-        attributes.get("name")
-        or ""
-    )
-
-    # Pool names are normally "TOKEN / SOL" or
-    # "TOKEN / USDC". This gives us a symbol without
-    # making another token-info request.
-    symbol = pool_name.split(" / ")[0].strip()
-
-    return {
-        "pool_address": address,
-        "token_address": token_address,
-        "pool_name": pool_name,
-        "symbol": symbol,
-        "source_type": source_type,
-        "dex": dex_data.get("id"),
-        "quote_id": quote_id,
-        "price": safe_float(
-            attributes.get("base_token_price_usd")
-        ),
-        "liquidity": safe_float(
-            attributes.get("reserve_in_usd")
-        ),
-        "volume_24h": safe_float(
-            volume.get("h24")
-        ),
-        "tx_24h": tx_count(tx, "h24"),
-        "pool_created_at": parse_time(
-            attributes.get("pool_created_at")
-        ),
-        "change_24h": safe_float(
-            changes.get("h24")
-        ),
-        "fdv": safe_float(
-            attributes.get("fdv_usd")
-        ),
-    }
-
-
-def tx_count(
-    transactions: dict[str, Any],
-    key: str,
-) -> int:
-
+def tx_count(transactions: dict[str, Any], key: str) -> int:
     value = transactions.get(key) or {}
 
     if isinstance(value, dict):
@@ -974,81 +632,132 @@ def tx_count(
         return 0
 
 
-def discover_candidates() -> list[dict[str, Any]]:
-    """
-    Discover pools across the full Solana pool lists.
+def parse_pool(item: dict[str, Any], source_type: str) -> dict[str, Any]:
+    attributes = item.get("attributes") or {}
+    relationships = item.get("relationships") or {}
 
-    By default this keeps requesting pages until GeckoTerminal returns an
-    empty page. There is no 30/50/100 candidate cap.
+    pool_id = item.get("id", "")
 
-    Important: GeckoTerminal is paginated and rate-limited, so "unlimited"
-    means "all pages the API makes available", not an infinite request loop.
-    """
+    address = (
+        attributes.get("address")
+        or pool_id.split("_", 1)[-1]
+    )
 
-    def all_pages(
-        endpoint: str,
-        params: dict[str, Any] | None = None,
-        source_type: str = "ESTABLISHED",
-    ) -> list[dict[str, Any]]:
+    base_data = (
+        relationships.get("base_token", {}).get("data") or {}
+    )
 
-        results = []
-        page = 1
+    quote_data = (
+        relationships.get("quote_token", {}).get("data") or {}
+    )
 
-        while True:
-            if MAX_POOL_PAGES > 0 and page > MAX_POOL_PAGES:
-                break
+    dex_data = (
+        relationships.get("dex", {}).get("data") or {}
+    )
 
-            query = dict(params or {})
-            query["page"] = page
+    base_id = base_data.get("id") or ""
+    quote_id = quote_data.get("id") or ""
 
-            try:
-                payload = get_json(endpoint, query)
-            except Exception as exc:
-                print(
-                    f"[WARN] Pool discovery stopped at page {page} "
-                    f"for {source_type}: {exc}"
-                )
-                break
+    token_address = (
+        base_id.split("_", 1)[1]
+        if "_" in base_id
+        else None
+    )
 
-            data = payload.get("data", []) or []
+    tx = attributes.get("transactions") or {}
+    volume = attributes.get("volume_usd") or {}
+    changes = attributes.get("price_change_percentage") or {}
 
-            if not data:
-                print(
-                    f"[INFO] {source_type}: finished at page {page - 1}"
-                )
-                break
+    pool_name = attributes.get("name") or ""
+    symbol = pool_name.split(" / ")[0].strip()
 
-            for item in data:
-                results.append(
-                    parse_pool(item, source_type)
-                )
+    return {
+        "pool_address": address,
+        "token_address": token_address,
+        "pool_name": pool_name,
+        "symbol": symbol,
+        "source_type": source_type,
+        "dex": dex_data.get("id"),
+        "quote_id": quote_id,
+        "price": safe_float(attributes.get("base_token_price_usd")),
+        "liquidity": safe_float(attributes.get("reserve_in_usd")),
+        "volume_24h": safe_float(volume.get("h24")),
+        "tx_24h": tx_count(tx, "h24"),
+        "pool_created_at": parse_time(attributes.get("pool_created_at")),
+        "change_24h": safe_float(changes.get("h24")),
+        "fdv": safe_float(attributes.get("fdv_usd")),
+    }
 
+
+def discover_all_pools(
+    endpoint: str,
+    params: dict[str, Any],
+    source_type: str,
+) -> list[dict[str, Any]]:
+
+    results = []
+    page = 1
+
+    while True:
+        if MAX_POOL_PAGES > 0 and page > MAX_POOL_PAGES:
             print(
-                f"[INFO] {source_type}: page {page} "
-                f"({len(data)} pools)"
+                f"[INFO] {source_type}: stopped at configured "
+                f"MAX_POOL_PAGES={MAX_POOL_PAGES}"
             )
+            break
 
-            # A normal paginated endpoint returns fewer records on its final
-            # page. Stop there rather than making an unnecessary extra call.
-            if len(data) < 20:
-                print(
-                    f"[INFO] {source_type}: final partial page reached"
-                )
-                break
+        query = dict(params)
+        query["page"] = page
 
-            page += 1
+        try:
+            payload = get_json(endpoint, query)
+        except Exception as exc:
+            print(
+                f"[WARN] {source_type}: discovery stopped at "
+                f"page {page}: {exc}"
+            )
+            break
 
-        return results
+        data = payload.get("data", []) or []
 
-    print("[INFO] Scanning ALL Solana NEW POOL pages...")
-    new_pools = all_pages(
+        if not data:
+            print(
+                f"[INFO] {source_type}: finished at page {page - 1}"
+            )
+            break
+
+        for item in data:
+            results.append(parse_pool(item, source_type))
+
+        print(
+            f"[INFO] {source_type}: page {page} "
+            f"({len(data)} pools)"
+        )
+
+        # GeckoTerminal commonly returns a partial final page.
+        if len(data) < 20:
+            print(
+                f"[INFO] {source_type}: final partial page reached"
+            )
+            break
+
+        page += 1
+
+    return results
+
+
+def discover_candidates() -> list[dict[str, Any]]:
+    print("[INFO] Scanning ALL AVAILABLE Solana NEW POOL pages...")
+
+    new_pools = discover_all_pools(
         f"/networks/{NETWORK}/new_pools",
         {"include": "base_token,quote_token,dex"},
         "NEW",
     )
 
-    print("[INFO] Scanning ALL Solana ESTABLISHED POOL pages...")
-    established_pools = all_pages(
+    print("[INFO] Scanning ALL AVAILABLE Solana ESTABLISHED POOL pages...")
+
+    established_pools = discover_all_pools(
         f"/networks/{NETWORK}/pools",
         {
             "include": "base_token,quote_token,dex",
@@ -1057,22 +766,18 @@ def discover_candidates() -> list[dict[str, Any]]:
         "ESTABLISHED",
     )
 
-    print("[INFO] Scanning ALL Solana TRENDING POOL pages...")
-    trending_pools = all_pages(
+    print("[INFO] Scanning ALL AVAILABLE Solana TRENDING POOL pages...")
+
+    trending_pools = discover_all_pools(
         f"/networks/{NETWORK}/trending_pools",
         {"include": "base_token,quote_token,dex"},
         "TRENDING",
     )
 
-    # Deduplicate every discovered pool by its address.
     seen = set()
     selected = []
 
-    for item in (
-        new_pools
-        + established_pools
-        + trending_pools
-    ):
+    for item in new_pools + established_pools + trending_pools:
         address = item["pool_address"]
 
         if not address or address in seen:
@@ -1089,14 +794,11 @@ def discover_candidates() -> list[dict[str, Any]]:
     return selected
 
 
-# ============================================================
-# OHLCV / NUMBERS
-# ============================================================
+# =========================
+# OHLCV
+# =========================
 
-def get_15m_candles(
-    pool_address: str,
-) -> list[tuple[int, float]]:
-
+def get_15m_candles(pool_address: str):
     payload = get_json(
         f"/networks/{NETWORK}/pools/"
         f"{quote(pool_address, safe='')}/ohlcv/minute",
@@ -1117,10 +819,7 @@ def get_15m_candles(
     rows = []
 
     for row in raw:
-        if not isinstance(row, (list, tuple)):
-            continue
-
-        if len(row) < 5:
+        if not isinstance(row, (list, tuple)) or len(row) < 5:
             continue
 
         try:
@@ -1131,53 +830,38 @@ def get_15m_candles(
         close = safe_float(row[4])
 
         if close and close > 0:
-            rows.append(
-                (timestamp, close)
-            )
+            rows.append((timestamp, close))
 
     rows.sort(key=lambda x: x[0])
-
     return rows
 
 
 def nearest_change(
-    rows: list[tuple[int, float]],
+    rows,
     target_seconds: int,
     min_seconds: int,
     max_seconds: int,
-) -> tuple[float, int] | None:
-
+):
     if len(rows) < 2:
         return None
 
     latest_ts, latest_price = rows[-1]
-
     choices = []
 
     for timestamp, old_price in rows[:-1]:
-
         elapsed = latest_ts - timestamp
 
-        if not (
-            min_seconds
-            <= elapsed
-            <= max_seconds
-        ):
+        if not min_seconds <= elapsed <= max_seconds:
             continue
 
-        change = pct_change(
-            latest_price,
-            old_price,
-        )
+        change = pct_change(latest_price, old_price)
 
         if change is None:
             continue
 
         choices.append(
             (
-                abs(
-                    elapsed - target_seconds
-                ),
+                abs(elapsed - target_seconds),
                 change,
                 elapsed,
             )
@@ -1187,40 +871,25 @@ def nearest_change(
         return None
 
     choices.sort(key=lambda x: x[0])
-
     _, change, elapsed = choices[0]
 
     return change, elapsed
 
 
-def best_down(
-    rows: list[tuple[int, float]],
-    min_seconds: int,
-    max_seconds: int,
-) -> tuple[float, int] | None:
-
+def best_down(rows, min_seconds: int, max_seconds: int):
     if len(rows) < 2:
         return None
 
     latest_ts, latest_price = rows[-1]
-
     best = None
 
     for timestamp, old_price in rows[:-1]:
-
         elapsed = latest_ts - timestamp
 
-        if not (
-            min_seconds
-            <= elapsed
-            <= max_seconds
-        ):
+        if not min_seconds <= elapsed <= max_seconds:
             continue
 
-        change = pct_change(
-            latest_price,
-            old_price,
-        )
+        change = pct_change(latest_price, old_price)
 
         if change is None:
             continue
@@ -1231,34 +900,20 @@ def best_down(
     return best
 
 
-def best_up(
-    rows: list[tuple[int, float]],
-    min_seconds: int,
-    max_seconds: int,
-) -> tuple[float, int] | None:
-
+def best_up(rows, min_seconds: int, max_seconds: int):
     if len(rows) < 2:
         return None
 
     latest_ts, latest_price = rows[-1]
-
     best = None
 
     for timestamp, old_price in rows[:-1]:
-
         elapsed = latest_ts - timestamp
 
-        if not (
-            min_seconds
-            <= elapsed
-            <= max_seconds
-        ):
+        if not min_seconds <= elapsed <= max_seconds:
             continue
 
-        change = pct_change(
-            latest_price,
-            old_price,
-        )
+        change = pct_change(latest_price, old_price)
 
         if change is None:
             continue
@@ -1269,10 +924,7 @@ def best_up(
     return best
 
 
-def observed_24h_high(
-    rows: list[tuple[int, float]],
-) -> tuple[float | None, int | None]:
-
+def observed_24h_high(rows):
     if not rows:
         return None, None
 
@@ -1286,10 +938,7 @@ def observed_24h_high(
     if not recent:
         recent = rows
 
-    high = max(
-        price for _, price in recent
-    )
-
+    high = max(price for _, price in recent)
     high_ts = max(
         ts for ts, price in recent
         if price == high
@@ -1298,93 +947,53 @@ def observed_24h_high(
     return high, high_ts
 
 
-# ============================================================
+# =========================
 # ALERT LOGIC
-# ============================================================
+# =========================
 
 def build_alert_key(
-    change_15m: float | None,
-    change_1h: float | None,
-    down_24h: float | None,
-    drawdown_24h: float | None,
-    up_1h: float | None,
-) -> str | None:
-    """
-    ALERT RULES:
-
-    DIP:
-      - Only -30% or worse is an alert.
-      - Smaller drops (-5%, -15%, -20%, -29.99%) are ignored.
-
-    PUMP:
-      - Only strictly above +100% is an alert.
-      - +100.00% exactly is not a pump alert.
-    """
-
+    change_15m,
+    change_1h,
+    down_24h,
+    drawdown_24h,
+    up_1h,
+):
     levels = []
 
-    # ---------------- DIP ALERTS ----------------
-    if (
-        change_15m is not None
-        and change_15m <= -MIN_DIP_ALERT
-    ):
+    # ONLY -30% OR WORSE.
+    if change_15m is not None and change_15m <= -MIN_DIP_ALERT:
         levels.append("DIP_15M_30")
 
-    if (
-        change_1h is not None
-        and change_1h <= -MIN_DIP_ALERT
-    ):
+    if change_1h is not None and change_1h <= -MIN_DIP_ALERT:
         levels.append("DIP_1H_30")
 
-    if (
-        down_24h is not None
-        and down_24h <= -MIN_DIP_ALERT
-    ):
+    if down_24h is not None and down_24h <= -MIN_DIP_ALERT:
         levels.append("DIP_24H_30")
 
-    if (
-        drawdown_24h is not None
-        and drawdown_24h >= ULTRA_DIP_24H
-    ):
-        levels.append("DIP_99")
-    elif (
-        drawdown_24h is not None
-        and drawdown_24h >= EXTREME_DIP_24H
-    ):
-        levels.append("DIP_95")
-    elif (
-        drawdown_24h is not None
-        and drawdown_24h >= DEEP_DIP_24H
-    ):
-        levels.append("DIP_80")
-    elif (
-        drawdown_24h is not None
-        and drawdown_24h >= MIN_DIP_ALERT
-    ):
-        levels.append("DIP_30")
+    if drawdown_24h is not None:
+        if drawdown_24h >= ULTRA_DIP_24H:
+            levels.append("DIP_99")
+        elif drawdown_24h >= EXTREME_DIP_24H:
+            levels.append("DIP_95")
+        elif drawdown_24h >= DEEP_DIP_24H:
+            levels.append("DIP_80")
+        elif drawdown_24h >= MIN_DIP_ALERT:
+            levels.append("DIP_30")
 
-    # ---------------- PUMP ALERT ----------------
-    # Strictly greater than +100%.
-    if (
-        up_1h is not None
-        and up_1h > PUMP_1H
-    ):
+    # ONLY STRICTLY ABOVE +100%.
+    if up_1h is not None and up_1h > PUMP_1H:
         levels.append("PUMP100+")
 
     return "+".join(levels) if levels else None
 
 
-# ============================================================
+# =========================
 # TELEGRAM
-# ============================================================
+# =========================
 
 def send_telegram(message: str) -> bool:
-
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(
-            "\n[TELEGRAM NOT CONFIGURED]\n"
-            + message
-        )
+        print("\n[TELEGRAM NOT CONFIGURED]\n" + message)
         return False
 
     url = (
@@ -1414,52 +1023,34 @@ def send_telegram(message: str) -> bool:
         return True
 
     except requests.RequestException as exc:
-        print(
-            f"[WARN] Telegram request failed: {exc}"
-        )
+        print(f"[WARN] Telegram request failed: {exc}")
         return False
 
 
-# ============================================================
+# =========================
 # DATABASE WRITE
-# ============================================================
+# =========================
 
 def save_scan(
-    conn: sqlite3.Connection,
-    p: dict[str, Any],
-    change_15m: float | None,
-    change_1h: float | None,
-    drawdown_24h: float | None,
-    result: str,
-) -> None:
-
+    conn,
+    p,
+    change_15m,
+    change_1h,
+    drawdown_24h,
+    result,
+):
     created = p.get("pool_created_at")
-
     age_hours = None
 
     if created:
-        age_hours = max(
-            0,
-            (now_ts() - created) / 3600,
-        )
+        age_hours = max(0, (now_ts() - created) / 3600)
 
     conn.execute(
         """
         INSERT INTO scans(
-            ts,
-            pool_address,
-            token_address,
-            symbol,
-            source_type,
-            price,
-            change_15m,
-            change_1h,
-            change_24h_high_drawdown,
-            liquidity,
-            volume_24h,
-            tx_24h,
-            pool_age_hours,
-            result
+            ts, pool_address, token_address, symbol, source_type,
+            price, change_15m, change_1h, change_24h_high_drawdown,
+            liquidity, volume_24h, tx_24h, pool_age_hours, result
         )
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
@@ -1485,46 +1076,29 @@ def save_scan(
 
 
 def update_pool(
-    conn: sqlite3.Connection,
-    p: dict[str, Any],
-    change_15m: float | None,
-    change_1h: float | None,
-    high_24h: float | None,
-    drawdown_24h: float | None,
-    alert_key: str | None,
-    alert_sent: bool,
-) -> None:
-
+    conn,
+    p,
+    change_15m,
+    change_1h,
+    high_24h,
+    drawdown_24h,
+    alert_key,
+    alert_sent,
+):
     old_key, old_ts = previous_alert(
         conn,
         p["pool_address"],
     )
 
-    last_key = (
-        alert_key if alert_sent else old_key
-    )
-
-    last_ts = (
-        now_ts() if alert_sent else old_ts
-    )
+    last_key = alert_key if alert_sent else old_key
+    last_ts = now_ts() if alert_sent else old_ts
 
     conn.execute(
         """
         INSERT INTO pools(
-            pool_address,
-            token_address,
-            symbol,
-            pool_name,
-            source_type,
-            first_seen,
-            last_seen,
-            last_price,
-            last_15m,
-            last_1h,
-            last_24h_high,
-            last_24h_drawdown,
-            last_alert_key,
-            last_alert_ts
+            pool_address, token_address, symbol, pool_name, source_type,
+            first_seen, last_seen, last_price, last_15m, last_1h,
+            last_24h_high, last_24h_drawdown, last_alert_key, last_alert_ts
         )
         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(pool_address) DO UPDATE SET
@@ -1562,21 +1136,20 @@ def update_pool(
     conn.commit()
 
 
-# ============================================================
+# =========================
 # TELEGRAM MESSAGE
-# ============================================================
+# =========================
 
 def alert_message(
-    p: dict[str, Any],
-    change_15m: float | None,
-    change_1h: float | None,
-    down_24h: tuple[float, int] | None,
-    drawdown_24h: float | None,
-    high_24h: float | None,
-    up_1h: tuple[float, int] | None,
-    alert_key: str,
-) -> str:
-
+    p,
+    change_15m,
+    change_1h,
+    down_24h,
+    drawdown_24h,
+    high_24h,
+    up_1h,
+    alert_key,
+):
     title = "🚨 SOLANA DIP RADAR"
 
     if "PUMP100+" in alert_key and "DIP_" not in alert_key:
@@ -1593,14 +1166,10 @@ def alert_message(
     ]
 
     if change_15m is not None:
-        lines.append(
-            f"15m: {change_15m:+.2f}%"
-        )
+        lines.append(f"15m: {change_15m:+.2f}%")
 
     if change_1h is not None:
-        lines.append(
-            f"1h: {change_1h:+.2f}%"
-        )
+        lines.append(f"1h: {change_1h:+.2f}%")
 
     if down_24h:
         lines.append(
@@ -1610,14 +1179,11 @@ def alert_message(
         )
 
     if high_24h:
-        lines.append(
-            f"24h high: {fmt_usd(high_24h)}"
-        )
+        lines.append(f"24h high: {fmt_usd(high_24h)}")
 
     if drawdown_24h is not None:
         lines.append(
-            f"Below 24h high: "
-            f"{drawdown_24h:.2f}%"
+            f"Below 24h high: {drawdown_24h:.2f}%"
         )
 
     if up_1h:
@@ -1641,7 +1207,6 @@ def alert_message(
         f"Mint: {p['token_address'] or 'unknown'}",
         f"Pool: {p['pool_address']}",
         "",
-
         "⚠️ Research alert only. Deep drops can be caused by scams, "
         "rug pulls, liquidity removal or other risks.",
     ]
@@ -1649,12 +1214,11 @@ def alert_message(
     return "\n".join(lines)
 
 
-# ============================================================
-# MAIN SCAN
-# ============================================================
+# =========================
+# MAIN
+# =========================
 
-def scan() -> None:
-
+def scan():
     conn = init_db()
 
     started = datetime.now(
@@ -1664,25 +1228,23 @@ def scan() -> None:
     )
 
     print("")
-    print("=" * 64)
-    print("SOLANA DIP RADAR v2")
+    print("=" * 72)
+    print("SOLANA DIP RADAR v3")
     print(f"Started: {started}")
-    print("ALL SOLANA POOLS: PAGINATED / NO FIXED CANDIDATE CAP")
-    print("ESTABLISHED TOKENS: ON")
-    print("DEV HOLDING FILTER: API DATA REQUIRED")
-    print(f"TOKEN AGE FILTER: >= {MIN_POOL_AGE_DAYS * 24:.0f} HOURS")
-    print(f"MINIMUM POOL AGE: >= {MIN_POOL_AGE_DAYS * 24:.0f} HOURS")
+    print("ALL AVAILABLE SOLANA POOLS: PAGINATED / NO FIXED CANDIDATE CAP")
+    print("MINIMUM POOL AGE: >= 48 HOURS")
+    print("NO MAXIMUM AGE")
+    print("DEV HOLDING FILTER: <= 5% REQUIRED")
+    print("MINT AUTHORITY: MUST BE REVOKED")
+    print("METADATA: MUST BE IMMUTABLE")
     print("MINIMUM DIP ALERT: -30%")
     print("PUMP ALERT: > +100% ONLY")
     print("DIPS: -30% OR WORSE ONLY")
-    print("=" * 64)
+    print("=" * 72)
 
     candidates = discover_candidates()
 
-    print(
-        f"\nPools discovered: "
-        f"{len(candidates)}"
-    )
+    print(f"\nPools discovered: {len(candidates)}")
 
     source_counts = {}
     for p in candidates:
@@ -1699,107 +1261,77 @@ def scan() -> None:
 
     print(
         f"API spacing: {REQUEST_INTERVAL:.1f}s "
-        f"(deliberately slow to reduce 429 errors)"
+        "(deliberately slow to reduce 429 errors)"
     )
     print("")
 
-    for index, p in enumerate(
-        candidates,
-        start=1,
-    ):
-
-        name = (
-            p["symbol"]
-            or p["pool_name"]
-            or "UNKNOWN"
-        )
+    for index, p in enumerate(candidates, start=1):
+        name = p["symbol"] or p["pool_name"] or "UNKNOWN"
 
         try:
-            # AGE FILTER:
-            # Only scan pools/tokens that are at least 48 hours old.
-            # There is deliberately no maximum age.
+            # HARD 48-HOUR AGE FILTER.
             created_at = p.get("pool_created_at")
 
-            if created_at:
-                age_days = (
-                    now_ts() - created_at
-                ) / 86400.0
-
-                if age_days < MIN_POOL_AGE_DAYS:
-                    print(
-                        f"[{index:02d}] {name} "
-                        f"| {p['source_type']} "
-                        f"| too new "
-                        f"({age_days * 24:.1f}h < "
-                        f"{MIN_POOL_AGE_DAYS * 24:.0f}h)"
-                    )
-                    continue
-            else:
-                # If the API cannot tell us the pool age,
-                # don't assume it is old enough.
+            if not created_at:
                 print(
-                    f"[{index:02d}] {name} "
-                    f"| {p['source_type']} "
-                    f"| age unknown"
+                    f"[{index:04d}] {name} | "
+                    f"{p['source_type']} | age unknown | FILTERED"
                 )
                 continue
 
-            # Basic market-quality filter.
+            age_days = (now_ts() - created_at) / 86400.0
+
+            if age_days < MIN_POOL_AGE_DAYS:
+                print(
+                    f"[{index:04d}] {name} | "
+                    f"{p['source_type']} | too new "
+                    f"({age_days * 24:.1f}h < 48h)"
+                )
+                continue
+
             if p["price"] is None:
                 print(
-                    f"[{index:02d}] {name} "
-                    f"| {p['source_type']} "
-                    f"| NO PRICE"
+                    f"[{index:04d}] {name} | NO PRICE"
                 )
                 continue
 
-            if (
-                p["liquidity"] or 0
-            ) < MIN_LIQUIDITY:
+            if (p["liquidity"] or 0) < MIN_LIQUIDITY:
                 print(
-                    f"[{index:02d}] {name} "
-                    f"| {p['source_type']} "
-                    f"| low liquidity "
-                    f"{fmt_usd(p['liquidity'])}"
+                    f"[{index:04d}] {name} | "
+                    f"low liquidity {fmt_usd(p['liquidity'])}"
                 )
                 continue
 
-            if (
-                p["volume_24h"] or 0
-            ) < MIN_VOLUME_24H:
+            if (p["volume_24h"] or 0) < MIN_VOLUME_24H:
                 print(
-                    f"[{index:02d}] {name} "
-                    f"| {p['source_type']} "
-                    f"| low 24h volume "
-                    f"{fmt_usd(p['volume_24h'])}"
+                    f"[{index:04d}] {name} | "
+                    f"low 24h volume {fmt_usd(p['volume_24h'])}"
                 )
                 continue
 
             if p["tx_24h"] < MIN_TX_24H:
                 print(
-                    f"[{index:02d}] {name} "
-                    f"| {p['source_type']} "
-                    f"| low transactions "
-                    f"{p['tx_24h']}"
+                    f"[{index:04d}] {name} | "
+                    f"low transactions {p['tx_24h']}"
                 )
                 continue
 
-            # -----------------------------------------------------
-            # HARD SAFETY FILTERS
-            # -----------------------------------------------------
-            # Do this before expensive OHLCV work. If the token is
-            # mintable, metadata-mutable, or dev holdings exceed 5%,
-            # it is not shown and cannot alert.
-            safety_ok, safety_details, safety_reason = (
-                safety_check_token(
-                    p["token_address"]
+            if not p["token_address"]:
+                print(
+                    f"[{index:04d}] {name} | "
+                    "missing token address | FILTERED"
                 )
+                continue
+
+            # HARD SAFETY FILTERS BEFORE OHLCV.
+            safety_ok, safety_details, safety_reason = (
+                safety_check_token(p["token_address"])
             )
 
             if not safety_ok:
                 print(
-                    f"[{index:02d}] FILTERED {name} "
-                    f"| {safety_reason}"
+                    f"[{index:04d}] FILTERED {name} | "
+                    f"{safety_reason}"
                 )
                 save_scan(
                     conn,
@@ -1821,97 +1353,65 @@ def scan() -> None:
                 safety_details["mint_authority"]
             )
 
-            rows = get_15m_candles(
-                p["pool_address"]
-            )
+            rows = get_15m_candles(p["pool_address"])
 
             if len(rows) < 5:
                 print(
-                    f"[{index:02d}] {name} "
-                    f"| {p['source_type']} "
-                    f"| not enough candles"
+                    f"[{index:04d}] {name} | "
+                    "not enough candles"
                 )
                 continue
 
             latest_price = rows[-1][1]
-
-            # Use the actual latest OHLCV close when available.
             p["price"] = latest_price
 
             change_15m_data = nearest_change(
-                rows,
-                15 * 60,
-                10 * 60,
-                25 * 60,
+                rows, 15 * 60, 10 * 60, 25 * 60
             )
 
             change_1h_data = nearest_change(
-                rows,
-                60 * 60,
-                45 * 60,
-                90 * 60,
+                rows, 60 * 60, 45 * 60, 90 * 60
             )
 
             down_24h = best_down(
-                rows,
-                60 * 60,
-                24 * 60 * 60,
+                rows, 60 * 60, 24 * 60 * 60
             )
 
             up_1h = best_up(
-                rows,
-                60 * 60,
-                24 * 60 * 60,
+                rows, 60 * 60, 24 * 60 * 60
             )
 
             change_15m = (
                 change_15m_data[0]
-                if change_15m_data
-                else None
+                if change_15m_data else None
             )
 
             change_1h = (
                 change_1h_data[0]
-                if change_1h_data
-                else None
+                if change_1h_data else None
             )
 
-            high_24h, _ = observed_24h_high(
-                rows
-            )
+            high_24h, _ = observed_24h_high(rows)
 
             drawdown_24h = None
 
             if high_24h and high_24h > 0:
                 drawdown_24h = max(
                     0.0,
-                    (
-                        1.0
-                        - latest_price / high_24h
-                    ) * 100.0,
+                    (1.0 - latest_price / high_24h) * 100.0,
                 )
 
-            up_value = (
-                up_1h[0]
-                if up_1h
-                else None
-            )
+            up_value = up_1h[0] if up_1h else None
 
             alert_key = build_alert_key(
                 change_15m,
                 change_1h,
-                (
-                    down_24h[0]
-                    if down_24h
-                    else None
-                ),
+                down_24h[0] if down_24h else None,
                 drawdown_24h,
                 up_value,
             )
 
-            # IMPORTANT:
-            # Do NOT print ordinary movements such as -5%, -15%,
-            # -20% or -29.99%. The user only wants >=30% dips.
+            # SILENT for ordinary movements.
             if not alert_key:
                 save_scan(
                     conn,
@@ -1934,19 +1434,15 @@ def scan() -> None:
                 )
                 continue
 
-            # Only qualifying >=30% downward signals reach this point.
             print(
-                f"[{index:02d}] 🚨 DIP FOUND | "
+                f"[{index:04d}] 🚨 ALERT | "
                 f"{name} / {p['source_type']} | "
-                f"Price {fmt_usd(latest_price)} | "
                 f"15m "
                 f"{change_15m:+.2f}%"
                 if change_15m is not None
                 else
-                f"[{index:02d}] 🚨 DIP FOUND | "
-                f"{name} / {p['source_type']} | "
-                f"Price {fmt_usd(latest_price)} | "
-                f"15m n/a",
+                f"[{index:04d}] 🚨 ALERT | "
+                f"{name} / {p['source_type']} | 15m n/a",
                 end="",
             )
 
@@ -1955,28 +1451,14 @@ def scan() -> None:
                     f" | 1h {change_1h:+.2f}%",
                     end="",
                 )
-            else:
-                print(" | 1h n/a", end="")
 
-            print(
-                f" | 24hHigh↓ "
-                f"{drawdown_24h:.2f}%"
-                if drawdown_24h is not None
-                else " | 24hHigh↓ n/a"
-            )
-
-            if not alert_key:
-                update_pool(
-                    conn,
-                    p,
-                    change_15m,
-                    change_1h,
-                    high_24h,
-                    drawdown_24h,
-                    None,
-                    False,
+            if drawdown_24h is not None:
+                print(
+                    f" | 24hHigh↓ {drawdown_24h:.2f}%",
+                    end="",
                 )
-                continue
+
+            print()
 
             if not alert_allowed(
                 conn,
@@ -1985,7 +1467,7 @@ def scan() -> None:
             ):
                 print(
                     f"       ↳ {alert_key} "
-                    f"already alerted recently"
+                    "already alerted recently"
                 )
 
                 update_pool(
@@ -2026,28 +1508,25 @@ def scan() -> None:
 
             if sent:
                 print(
-                    f"       🚨 ALERT SENT: "
-                    f"{alert_key}"
+                    f"       🚨 ALERT SENT: {alert_key}"
                 )
             else:
                 print(
-                    f"       ⚠️ Signal found: "
-                    f"{alert_key}"
+                    f"       ⚠️ Signal found: {alert_key}"
                 )
 
         except Exception as exc:
-            # One bad token must never kill the whole scan.
             print(
-                f"[{index:02d}] ERROR {name}: "
+                f"[{index:04d}] ERROR {name}: "
                 f"{type(exc).__name__}: {exc}"
             )
 
     conn.close()
 
     print("")
-    print("=" * 64)
+    print("=" * 72)
     print("SCAN COMPLETE")
-    print("=" * 64)
+    print("=" * 72)
 
 
 if __name__ == "__main__":
