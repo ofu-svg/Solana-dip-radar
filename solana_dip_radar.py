@@ -109,8 +109,49 @@ def init_db() -> sqlite3.Connection:
     return conn
 
 
-def get_json(path: str, params: dict[str, Any]) -> dict[str, Any]:
+def get_json(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     url = f"{BASE_URL}{path}"
+
+    # Keep requests spaced out so we don't hammer the public API.
+    time.sleep(1.5)
+
+    for attempt in range(4):
+        try:
+            r = session.get(
+                url,
+                params=params or {},
+                timeout=30
+            )
+
+            if r.status_code == 429:
+                # Never trust a zero Retry-After value.
+                wait = min(5.0 * (attempt + 1), 20.0)
+
+                print(
+                    f"[WARN] GeckoTerminal rate limit (429). "
+                    f"Waiting {wait:.1f}s before retry {attempt + 1}/4..."
+                )
+
+                time.sleep(wait)
+                continue
+
+            r.raise_for_status()
+            return r.json()
+
+        except requests.RequestException as e:
+            if attempt >= 3:
+                raise
+
+            wait = min(5.0 * (attempt + 1), 20.0)
+
+            print(
+                f"[WARN] API request failed: {e}. "
+                f"Retrying in {wait:.1f}s..."
+            )
+
+            time.sleep(wait)
+
+    raise RuntimeError("GeckoTerminal API request failed after retries.")
 
     for attempt in range(4):
         try:
