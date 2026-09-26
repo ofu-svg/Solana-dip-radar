@@ -279,11 +279,10 @@ def parse_time(x: Any) -> int | None:
 
 
 def get_token_data(token_address: str) -> dict[str, Any]:
-    return get_json(f"/networks/{NETWORK}/tokens/{quote(token_address, safe='')}")
-
+    return get_json(f"/networks/{NETWORK}/tokens/{token_address}", {})
 
 def get_token_info(token_address: str) -> dict[str, Any]:
-    return get_json(f"/networks/{NETWORK}/tokens/{quote(token_address, safe='')}/info")
+    return get_json(f"/networks/{NETWORK}/tokens/{token_address}", {})
 
 
 def get_ohlcv(pool_address: str) -> list[list[Any]]:
