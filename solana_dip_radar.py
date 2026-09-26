@@ -25,6 +25,8 @@ from urllib.parse import quote
 import requests
 from dotenv import load_dotenv
 
+# Requires: requests, python-dotenv, solders
+
 load_dotenv()
 
 BASE_URL = os.getenv(
@@ -32,6 +34,27 @@ BASE_URL = os.getenv(
     "https://api.geckoterminal.com/api/v2",
 )
 NETWORK = "solana"
+
+# Solana RPC used for mint-authority and metadata/developer checks.
+# You can replace this with a Helius/QuickNode/other RPC URL in .env
+# if the public endpoint is rate-limited.
+SOLANA_RPC_URL = os.getenv(
+    "SOLANA_RPC_URL",
+    "https://api.mainnet-beta.solana.com",
+).strip()
+
+# Safety filters requested:
+MAX_DEV_HOLDING_PERCENT = float(
+    os.getenv("MAX_DEV_HOLDING_PERCENT", "5")
+)
+REQUIRE_MINT_AUTHORITY_REVOKED = (
+    os.getenv("REQUIRE_MINT_AUTHORITY_REVOKED", "true").lower()
+    == "true"
+)
+REQUIRE_METADATA_IMMUTABLE = (
+    os.getenv("REQUIRE_METADATA_IMMUTABLE", "true").lower()
+    == "true"
+)
 
 # Use a fresh DB by default so the old broken schema cannot interfere.
 DB_PATH = os.getenv("DB_PATH", "solana_dip_radar_v2.sqlite3")
@@ -63,7 +86,7 @@ DEEP_DIP_24H = float(os.getenv("DEEP_DIP_24H", "80"))
 EXTREME_DIP_24H = float(os.getenv("EXTREME_DIP_24H", "95"))
 ULTRA_DIP_24H = float(os.getenv("ULTRA_DIP_24H", "99"))
 MIN_DIP_ALERT = 30.0  # Never report a dip smaller than -30%.
-PUMP_1H = float(os.getenv("PUMP_1H", "100"))
+PUMP_1H = max(100.0001, float(os.getenv("PUMP_1H", "100.0001")))  # Pump alert: >100%
 
 ALERT_COOLDOWN_HOURS = float(
     os.getenv("ALERT_COOLDOWN_HOURS", "12")
@@ -173,6 +196,470 @@ def format_duration(seconds: int) -> str:
         return f"{hours}h" if not rem else f"{hours}h {rem}m"
 
     return f"{hours / 24:.1f}d"
+
+
+# ============================================================
+# SOLANA SAFETY / AUTHORITY CHECKS
+# ============================================================
+
+# These checks are intentionally conservative:
+# if the RPC cannot verify a safety property, the token is rejected
+# rather than being shown as "safe".
+
+solana_session = requests.Session()
+solana_session.headers.update({
+    "accept": "application/json",
+    "content-type": "application/json",
+    "user-agent": "SolanaDipRadar/2.0",
+})
+
+
+def solana_rpc(method: str, params: list[Any]) -> Any:
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    }
+
+    response = solana_session.post(
+        SOLANA_RPC_URL,
+        json=payload,
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    data = response.json()
+
+    if data.get("error"):
+        raise RuntimeError(
+            f"Solana RPC {method}: {data['error']}"
+        )
+
+    return data.get("result")
+
+
+def get_mint_info(mint: str) -> dict[str, Any]:
+    result = solana_rpc(
+        "getAccountInfo",
+        [
+            mint,
+            {
+                "encoding": "jsonParsed",
+                "commitment": "confirmed",
+            },
+        ],
+    )
+
+    value = (result or {}).get("value")
+
+    if not value:
+        raise RuntimeError("Mint account not found")
+
+    parsed = (
+        value.get("data", {})
+        .get("parsed", {})
+    )
+
+    info = parsed.get("info", {})
+
+    if parsed.get("type") != "mint":
+        raise RuntimeError("Address is not a parsed SPL mint")
+
+    supply_raw = int(info.get("supply", 0))
+    decimals = int(info.get("decimals", 0))
+
+    return {
+        "mint_authority": info.get("mintAuthority"),
+        "freeze_authority": info.get("freezeAuthority"),
+        "supply_raw": supply_raw,
+        "decimals": decimals,
+        "supply": (
+            supply_raw / (10 ** decimals)
+            if decimals >= 0
+            else 0
+        ),
+    }
+
+
+def get_token_accounts_for_owner(
+    owner: str,
+    mint: str,
+) -> int:
+    result = solana_rpc(
+        "getTokenAccountsByOwner",
+        [
+            owner,
+            {
+                "mint": mint,
+            },
+            {
+                "encoding": "jsonParsed",
+                "commitment": "confirmed",
+            },
+        ],
+    )
+
+    total_raw = 0
+
+    for item in (result or {}).get("value", []):
+        parsed = (
+            item.get("account", {})
+            .get("data", {})
+            .get("parsed", {})
+        )
+
+        amount = (
+            parsed.get("info", {})
+            .get("tokenAmount", {})
+            .get("amount")
+        )
+
+        try:
+            total_raw += int(amount or 0)
+        except (TypeError, ValueError):
+            pass
+
+    return total_raw
+
+
+def metadata_pda(mint: str) -> str:
+    """
+    Derive the Metaplex Metadata PDA.
+    Requires solders (included in the requirements below).
+    """
+    from solders.pubkey import Pubkey
+
+    metadata_program = Pubkey.from_string(
+        "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+    )
+
+    mint_pubkey = Pubkey.from_string(mint)
+
+    pda, _ = Pubkey.find_program_address(
+        [
+            b"metadata",
+            bytes(metadata_program),
+            bytes(mint_pubkey),
+        ],
+        metadata_program,
+    )
+
+    return str(pda)
+
+
+def read_metadata_update_authority_and_mutability(
+    mint: str,
+) -> tuple[str | None, bool | None, list[str]]:
+    """
+    Read Metaplex metadata.
+
+    Returns:
+      (update_authority, is_mutable, creator_addresses)
+
+    If the metadata account cannot be decoded, returns (None, None, []).
+    """
+    try:
+        pda = metadata_pda(mint)
+
+        result = solana_rpc(
+            "getAccountInfo",
+            [
+                pda,
+                {
+                    "encoding": "base64",
+                    "commitment": "confirmed",
+                },
+            ],
+        )
+
+        value = (result or {}).get("value")
+
+        if not value:
+            return None, None, []
+
+        data = value.get("data")
+
+        if (
+            not isinstance(data, list)
+            or len(data) < 1
+        ):
+            return None, None, []
+
+        import base64
+        raw = base64.b64decode(data[0])
+
+        # Metaplex Metadata account layout:
+        # key(1) + update_authority(32) + mint(32) +
+        # name(4+32) + symbol(4+10) + uri(4+200) +
+        # seller_fee(2) + creators option...
+        #
+        # isMutable sits after the creators/collection/uses fields,
+        # so a full borsh decoder is preferable. We use solders/
+        # borsh-construct when available; otherwise fail closed.
+        try:
+            from borsh_construct import (
+                CStruct,
+                U8,
+                U16,
+                U32,
+                Bool,
+                Bytes,
+                Option,
+                Vec,
+            )
+
+            # A compact parser is implemented below instead of depending
+            # on a fragile fixed offset because creators are optional.
+            offset = 0
+
+            # key
+            offset += 1
+
+            update_authority = (
+                base58_encode(raw[offset:offset + 32])
+            )
+            offset += 32
+
+            # mint
+            offset += 32
+
+            def read_borsh_string(buf, pos):
+                length = int.from_bytes(
+                    buf[pos:pos + 4],
+                    "little",
+                )
+                pos += 4
+                value = buf[pos:pos + length]
+                pos += length
+                return value, pos
+
+            _, offset = read_borsh_string(raw, offset)  # name
+            _, offset = read_borsh_string(raw, offset)  # symbol
+            _, offset = read_borsh_string(raw, offset)  # uri
+
+            # seller fee basis points
+            offset += 2
+
+            # creators Option<Vec<Creator>>
+            creators_option = raw[offset]
+            offset += 1
+
+            creator_addresses = []
+
+            if creators_option == 1:
+                creator_count = int.from_bytes(
+                    raw[offset:offset + 4],
+                    "little",
+                )
+                offset += 4
+
+                # Creator = address(32) + verified(1) + share(1)
+                for _ in range(creator_count):
+                    creator_bytes = raw[offset:offset + 32]
+                    offset += 32
+                    creator_addresses.append(
+                        base58_encode(creator_bytes)
+                    )
+
+                    # verified + share
+                    offset += 2
+
+            # collection Option<Collection>
+            collection_option = raw[offset]
+            offset += 1
+
+            if collection_option == 1:
+                # key/discriminator + collection pubkey
+                offset += 1 + 32
+
+            # uses Option<Uses>
+            uses_option = raw[offset]
+            offset += 1
+
+            if uses_option == 1:
+                # use_method(1) + remaining(8) + total(8)
+                offset += 1 + 8 + 8
+
+            # is_mutable
+            is_mutable = bool(raw[offset])
+
+            return update_authority, is_mutable, creator_addresses
+
+        except Exception:
+            return None, None, []
+
+    except Exception:
+        return None, None, []
+
+
+def base58_encode(data: bytes) -> str:
+    alphabet = (
+        "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    )
+
+    number = int.from_bytes(data, "big")
+
+    if number == 0:
+        return "1" if data else ""
+
+    chars = []
+
+    while number:
+        number, remainder = divmod(number, 58)
+        chars.append(alphabet[remainder])
+
+    leading_zeroes = 0
+    for byte in data:
+        if byte != 0:
+            break
+        leading_zeroes += 1
+
+    return (
+        "1" * leading_zeroes
+        + "".join(reversed(chars))
+    )
+
+
+def get_dev_holding_percent(
+    mint: str,
+    mint_info: dict[str, Any],
+    update_authority: str | None,
+    creator_addresses: list[str] | None,
+) -> float | None:
+    """
+    Conservative developer/team holding estimate.
+
+    We inspect the Metaplex creator addresses and the metadata update
+    authority, then sum any token balance held directly by those wallets.
+
+    Only tokens that pass the configured creator/update-authority
+    holding threshold are allowed through this filter.
+    """
+    supply_raw = int(
+        mint_info.get("supply_raw", 0)
+    )
+
+    if supply_raw <= 0:
+        return None
+
+    owners = []
+
+    for owner in (creator_addresses or []):
+        if owner and owner not in owners:
+            owners.append(owner)
+
+    if (
+        update_authority
+        and update_authority not in owners
+    ):
+        owners.append(update_authority)
+
+    if not owners:
+        return None
+
+    total_raw = 0
+
+    for owner in owners:
+        try:
+            total_raw += get_token_accounts_for_owner(
+                owner,
+                mint,
+            )
+        except Exception:
+            # If any creator balance cannot be checked, fail closed.
+            return None
+
+    return (
+        total_raw
+        / supply_raw
+        * 100.0
+    )
+
+
+def safety_check_token(
+    mint: str,
+) -> tuple[bool, dict[str, Any], str]:
+    """
+    Returns:
+      (passes, details, reason)
+
+    Fail closed:
+    - mint authority must be revoked
+    - metadata must be immutable
+    - dev/update-authority holdings must be <=5%
+    - unknown verification => reject
+    """
+    details = {}
+
+    try:
+        mint_info = get_mint_info(mint)
+        details["mint_authority"] = mint_info.get(
+            "mint_authority"
+        )
+        details["freeze_authority"] = mint_info.get(
+            "freeze_authority"
+        )
+        details["supply"] = mint_info.get("supply")
+
+        if REQUIRE_MINT_AUTHORITY_REVOKED:
+            if mint_info.get("mint_authority") is not None:
+                return (
+                    False,
+                    details,
+                    "mintable (mint authority active)",
+                )
+
+        update_authority, is_mutable, creator_addresses = (
+            read_metadata_update_authority_and_mutability(
+                mint
+            )
+        )
+
+        details["update_authority"] = update_authority
+        details["metadata_mutable"] = is_mutable
+        details["creator_addresses"] = creator_addresses
+
+        if REQUIRE_METADATA_IMMUTABLE:
+            if is_mutable is not False:
+                return (
+                    False,
+                    details,
+                    "metadata mutable or unverified",
+                )
+
+        dev_pct = get_dev_holding_percent(
+            mint,
+            mint_info,
+            update_authority,
+            creator_addresses,
+        )
+
+        details["dev_holding_percent"] = dev_pct
+
+        if dev_pct is None:
+            return (
+                False,
+                details,
+                "dev holdings unverified",
+            )
+
+        if dev_pct > MAX_DEV_HOLDING_PERCENT:
+            return (
+                False,
+                details,
+                f"dev holds {dev_pct:.2f}% > "
+                f"{MAX_DEV_HOLDING_PERCENT:.2f}%",
+            )
+
+        return True, details, "passed"
+
+    except Exception as exc:
+        return (
+            False,
+            details,
+            f"safety check error: {exc}",
+        )
 
 
 # ============================================================
@@ -795,66 +1282,69 @@ def build_alert_key(
     drawdown_24h: float | None,
     up_1h: float | None,
 ) -> str | None:
+    """
+    ALERT RULES:
+
+    DIP:
+      - Only -30% or worse is an alert.
+      - Smaller drops (-5%, -15%, -20%, -29.99%) are ignored.
+
+    PUMP:
+      - Only strictly above +100% is an alert.
+      - +100.00% exactly is not a pump alert.
+    """
 
     levels = []
 
-    # Hard floor: ordinary dips such as -15% or -20% are not alerts.
-    # A dip alert must be at least -30%.
-    if (
-        (change_15m is None or change_15m > -MIN_DIP_ALERT)
-        and (change_1h is None or change_1h > -MIN_DIP_ALERT)
-        and (down_24h is None or down_24h > -MIN_DIP_ALERT)
-    ):
-        # Still allow an extreme upward move to be handled separately.
-        if up_1h is None or up_1h < PUMP_1H:
-            return None
-
+    # ---------------- DIP ALERTS ----------------
     if (
         change_15m is not None
-        and change_15m <= -CRASH_15M
+        and change_15m <= -MIN_DIP_ALERT
     ):
-        levels.append("CRASH15")
+        levels.append("DIP_15M_30")
 
     if (
         change_1h is not None
-        and change_1h <= -CRASH_1H
+        and change_1h <= -MIN_DIP_ALERT
     ):
-        levels.append("CRASH1H")
+        levels.append("DIP_1H_30")
 
     if (
         down_24h is not None
-        and down_24h <= -CRASH_24H
+        and down_24h <= -MIN_DIP_ALERT
     ):
-        levels.append("CRASH24H")
+        levels.append("DIP_24H_30")
 
     if (
         drawdown_24h is not None
         and drawdown_24h >= ULTRA_DIP_24H
     ):
-        levels.append("DIP99")
-
+        levels.append("DIP_99")
     elif (
         drawdown_24h is not None
         and drawdown_24h >= EXTREME_DIP_24H
     ):
-        levels.append("DIP95")
-
+        levels.append("DIP_95")
     elif (
         drawdown_24h is not None
         and drawdown_24h >= DEEP_DIP_24H
     ):
-        levels.append("DIP80")
+        levels.append("DIP_80")
+    elif (
+        drawdown_24h is not None
+        and drawdown_24h >= MIN_DIP_ALERT
+    ):
+        levels.append("DIP_30")
 
+    # ---------------- PUMP ALERT ----------------
+    # Strictly greater than +100%.
     if (
         up_1h is not None
-        and up_1h >= PUMP_1H
+        and up_1h > PUMP_1H
     ):
-        levels.append("PUMP100")
+        levels.append("PUMP100+")
 
-    if not levels:
-        return None
-
-    return "+".join(levels)
+    return "+".join(levels) if levels else None
 
 
 # ============================================================
@@ -1060,8 +1550,13 @@ def alert_message(
     alert_key: str,
 ) -> str:
 
+    title = "🚨 SOLANA DIP RADAR"
+
+    if "PUMP100+" in alert_key and "DIP_" not in alert_key:
+        title = "🚀 SOLANA PUMP ALERT"
+
     lines = [
-        "🚨 SOLANA DIP RADAR",
+        title,
         "",
         f"Token: {p['symbol'] or 'UNKNOWN'}",
         f"Type: {p['source_type']}",
@@ -1111,12 +1606,15 @@ def alert_message(
         f"24h volume: {fmt_usd(p['volume_24h'])}",
         f"24h transactions: {p['tx_24h']}",
         f"DEX: {p['dex'] or 'unknown'}",
+        f"Dev holdings: {p.get('dev_holding_percent', 0):.2f}% (MAX 5%)",
+        "Metadata mutable: NO",
+        "Mint authority: REVOKED",
         f"Signal: {alert_key}",
         "",
         f"Mint: {p['token_address'] or 'unknown'}",
         f"Pool: {p['pool_address']}",
         "",
-        "Dev holdings: not verified by GeckoTerminal public pool data\n"
+
         "⚠️ Research alert only. Deep drops can be caused by scams, "
         "rug pulls, liquidity removal or other risks.",
     ]
@@ -1147,6 +1645,8 @@ def scan() -> None:
     print("DEV HOLDING FILTER: API DATA REQUIRED")
     print(f"TOKEN AGE FILTER: >= {MIN_POOL_AGE_DAYS:.0f} DAYS")
     print("MINIMUM DIP ALERT: -30%")
+    print("PUMP ALERT: > +100% ONLY")
+    print("DIPS: -30% OR WORSE ONLY")
     print("=" * 64)
 
     candidates = discover_candidates()
@@ -1255,6 +1755,43 @@ def scan() -> None:
                 )
                 continue
 
+            # -----------------------------------------------------
+            # HARD SAFETY FILTERS
+            # -----------------------------------------------------
+            # Do this before expensive OHLCV work. If the token is
+            # mintable, metadata-mutable, or dev holdings exceed 5%,
+            # it is not shown and cannot alert.
+            safety_ok, safety_details, safety_reason = (
+                safety_check_token(
+                    p["token_address"]
+                )
+            )
+
+            if not safety_ok:
+                print(
+                    f"[{index:02d}] FILTERED {name} "
+                    f"| {safety_reason}"
+                )
+                save_scan(
+                    conn,
+                    p,
+                    None,
+                    None,
+                    None,
+                    f"FILTERED: {safety_reason}",
+                )
+                continue
+
+            p["dev_holding_percent"] = (
+                safety_details["dev_holding_percent"]
+            )
+            p["metadata_mutable"] = (
+                safety_details["metadata_mutable"]
+            )
+            p["mint_authority"] = (
+                safety_details["mint_authority"]
+            )
+
             rows = get_15m_candles(
                 p["pool_address"]
             )
@@ -1343,15 +1880,41 @@ def scan() -> None:
                 up_value,
             )
 
+            # IMPORTANT:
+            # Do NOT print ordinary movements such as -5%, -15%,
+            # -20% or -29.99%. The user only wants >=30% dips.
+            if not alert_key:
+                save_scan(
+                    conn,
+                    p,
+                    change_15m,
+                    change_1h,
+                    drawdown_24h,
+                    "NO_ALERT",
+                )
+
+                update_pool(
+                    conn,
+                    p,
+                    change_15m,
+                    change_1h,
+                    high_24h,
+                    drawdown_24h,
+                    None,
+                    False,
+                )
+                continue
+
+            # Only qualifying >=30% downward signals reach this point.
             print(
-                f"[{index:02d}] "
+                f"[{index:02d}] 🚨 DIP FOUND | "
                 f"{name} / {p['source_type']} | "
                 f"Price {fmt_usd(latest_price)} | "
                 f"15m "
                 f"{change_15m:+.2f}%"
                 if change_15m is not None
                 else
-                f"[{index:02d}] "
+                f"[{index:02d}] 🚨 DIP FOUND | "
                 f"{name} / {p['source_type']} | "
                 f"Price {fmt_usd(latest_price)} | "
                 f"15m n/a",
@@ -1360,46 +1923,17 @@ def scan() -> None:
 
             if change_1h is not None:
                 print(
-                    f" | 1h "
-                    f"{change_1h:+.2f}%",
+                    f" | 1h {change_1h:+.2f}%",
                     end="",
                 )
             else:
-                print(
-                    " | 1h n/a",
-                    end="",
-                )
+                print(" | 1h n/a", end="")
 
             print(
                 f" | 24hHigh↓ "
                 f"{drawdown_24h:.2f}%"
                 if drawdown_24h is not None
-                else " | 24hHigh↓ n/a",
-                end="",
-            )
-
-            print(
-                f" | Liq "
-                f"{fmt_usd(p['liquidity'])} "
-                f"| Vol "
-                f"{fmt_usd(p['volume_24h'])} "
-                f"| Age "
-                f"{format_age(p['pool_created_at'])}"
-            )
-
-            result = (
-                "ALERT"
-                if alert_key
-                else "NO_ALERT"
-            )
-
-            save_scan(
-                conn,
-                p,
-                change_15m,
-                change_1h,
-                drawdown_24h,
-                result,
+                else " | 24hHigh↓ n/a"
             )
 
             if not alert_key:
