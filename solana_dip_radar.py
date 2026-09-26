@@ -60,14 +60,15 @@ REQUIRE_METADATA_IMMUTABLE = (
 DB_PATH = os.getenv("DB_PATH", "solana_dip_radar_v2.sqlite3")
 
 # -------- SCANNER SETTINGS --------
-TOTAL_CANDIDATES = int(os.getenv("TOTAL_CANDIDATES", "30"))
-NEW_CANDIDATES = int(os.getenv("NEW_CANDIDATES", "15"))
-ESTABLISHED_CANDIDATES = TOTAL_CANDIDATES - NEW_CANDIDATES
+# No fixed candidate cap: paginate through every pool page returned by
+# GeckoTerminal, then apply the age/liquidity/volume/security filters.
+# Set MAX_POOL_PAGES in .env only if you deliberately want a cap.
+MAX_POOL_PAGES = int(os.getenv("MAX_POOL_PAGES", "0"))  # 0 = unlimited
 
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY_USD", "300"))
 MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H_USD", "30"))
 MIN_TX_24H = int(os.getenv("MIN_TX_24H", "10"))
-MIN_POOL_AGE_DAYS = float(os.getenv("MIN_POOL_AGE_DAYS", "7"))
+MIN_POOL_AGE_DAYS = float(os.getenv("MIN_POOL_AGE_DAYS", "2"))
 
 # IMPORTANT: only pools at least 7 days old are scanned.
 # Very new tokens are intentionally excluded.
@@ -974,92 +975,118 @@ def tx_count(
 
 
 def discover_candidates() -> list[dict[str, Any]]:
+    """
+    Discover pools across the full Solana pool lists.
 
-    print("[INFO] Finding NEW pools...")
+    By default this keeps requesting pages until GeckoTerminal returns an
+    empty page. There is no 30/50/100 candidate cap.
 
-    new_items = pool_list(
+    Important: GeckoTerminal is paginated and rate-limited, so "unlimited"
+    means "all pages the API makes available", not an infinite request loop.
+    """
+
+    def all_pages(
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        source_type: str = "ESTABLISHED",
+    ) -> list[dict[str, Any]]:
+
+        results = []
+        page = 1
+
+        while True:
+            if MAX_POOL_PAGES > 0 and page > MAX_POOL_PAGES:
+                break
+
+            query = dict(params or {})
+            query["page"] = page
+
+            try:
+                payload = get_json(endpoint, query)
+            except Exception as exc:
+                print(
+                    f"[WARN] Pool discovery stopped at page {page} "
+                    f"for {source_type}: {exc}"
+                )
+                break
+
+            data = payload.get("data", []) or []
+
+            if not data:
+                print(
+                    f"[INFO] {source_type}: finished at page {page - 1}"
+                )
+                break
+
+            for item in data:
+                results.append(
+                    parse_pool(item, source_type)
+                )
+
+            print(
+                f"[INFO] {source_type}: page {page} "
+                f"({len(data)} pools)"
+            )
+
+            # A normal paginated endpoint returns fewer records on its final
+            # page. Stop there rather than making an unnecessary extra call.
+            if len(data) < 20:
+                print(
+                    f"[INFO] {source_type}: final partial page reached"
+                )
+                break
+
+            page += 1
+
+        return results
+
+    print("[INFO] Scanning ALL Solana NEW POOL pages...")
+    new_pools = all_pages(
         f"/networks/{NETWORK}/new_pools",
         {"include": "base_token,quote_token,dex"},
-        pages=2,
+        "NEW",
     )
 
-    print("[INFO] Finding ESTABLISHED pools...")
-
-    established_items = pool_list(
+    print("[INFO] Scanning ALL Solana ESTABLISHED POOL pages...")
+    established_pools = all_pages(
         f"/networks/{NETWORK}/pools",
         {
             "include": "base_token,quote_token,dex",
             "sort": "h24_volume_usd_desc",
         },
-        pages=2,
+        "ESTABLISHED",
     )
 
-    print("[INFO] Finding TRENDING pools...")
-
-    trending_items = pool_list(
+    print("[INFO] Scanning ALL Solana TRENDING POOL pages...")
+    trending_pools = all_pages(
         f"/networks/{NETWORK}/trending_pools",
         {"include": "base_token,quote_token,dex"},
-        pages=1,
+        "TRENDING",
     )
 
-    new_pools = [
-        parse_pool(x, "NEW")
-        for x in new_items
-    ]
+    # Deduplicate every discovered pool by its address.
+    seen = set()
+    selected = []
 
-    established_pools = [
-        parse_pool(x, "ESTABLISHED")
-        for x in (
-            established_items
-            + trending_items
-        )
-    ]
+    for item in (
+        new_pools
+        + established_pools
+        + trending_pools
+    ):
+        address = item["pool_address"]
 
-    # Deduplicate by pool address.
-    def dedupe(items):
-        seen = set()
-        result = []
+        if not address or address in seen:
+            continue
 
-        for item in items:
-            address = item["pool_address"]
+        seen.add(address)
+        selected.append(item)
 
-            if not address or address in seen:
-                continue
-
-            seen.add(address)
-            result.append(item)
-
-        return result
-
-    new_pools = dedupe(new_pools)
-    established_pools = dedupe(established_pools)
-
-    # Prefer pools with actual liquidity/volume.
-    new_pools.sort(
-        key=lambda p: (
-            p["liquidity"] or 0,
-            p["volume_24h"] or 0,
-        ),
-        reverse=True,
+    print(
+        f"[INFO] Total unique Solana pools discovered: "
+        f"{len(selected)}"
     )
 
-    established_pools.sort(
-        key=lambda p: (
-            p["volume_24h"] or 0,
-            p["liquidity"] or 0,
-        ),
-        reverse=True,
-    )
-
-    selected = (
-        new_pools[:NEW_CANDIDATES]
-        + established_pools[:ESTABLISHED_CANDIDATES]
-    )
-
-    # Final deduplication in case a pool appears in both lists.
-    selected = dedupe(selected)
-
-    return selected[:TOTAL_CANDIDATES]
+    return selected
 
 
 # ============================================================
@@ -1640,10 +1667,11 @@ def scan() -> None:
     print("=" * 64)
     print("SOLANA DIP RADAR v2")
     print(f"Started: {started}")
-    print("NEW TOKENS: DISCOVERED, BUT < 7 DAYS EXCLUDED")
+    print("ALL SOLANA POOLS: PAGINATED / NO FIXED CANDIDATE CAP")
     print("ESTABLISHED TOKENS: ON")
     print("DEV HOLDING FILTER: API DATA REQUIRED")
-    print(f"TOKEN AGE FILTER: >= {MIN_POOL_AGE_DAYS:.0f} DAYS")
+    print(f"TOKEN AGE FILTER: >= {MIN_POOL_AGE_DAYS * 24:.0f} HOURS")
+    print(f"MINIMUM POOL AGE: >= {MIN_POOL_AGE_DAYS * 24:.0f} HOURS")
     print("MINIMUM DIP ALERT: -30%")
     print("PUMP ALERT: > +100% ONLY")
     print("DIPS: -30% OR WORSE ONLY")
@@ -1652,20 +1680,21 @@ def scan() -> None:
     candidates = discover_candidates()
 
     print(
-        f"\nCandidates selected: "
+        f"\nPools discovered: "
         f"{len(candidates)}"
     )
 
-    new_count = sum(
-        1 for p in candidates
-        if p["source_type"] == "NEW"
-    )
-
-    established_count = len(candidates) - new_count
+    source_counts = {}
+    for p in candidates:
+        source = p["source_type"]
+        source_counts[source] = source_counts.get(source, 0) + 1
 
     print(
-        f"NEW: {new_count} | "
-        f"ESTABLISHED: {established_count}"
+        "Sources: "
+        + " | ".join(
+            f"{k}: {v}"
+            for k, v in sorted(source_counts.items())
+        )
     )
 
     print(
@@ -1687,7 +1716,7 @@ def scan() -> None:
 
         try:
             # AGE FILTER:
-            # Only scan pools/tokens that are at least 7 days old.
+            # Only scan pools/tokens that are at least 48 hours old.
             # There is deliberately no maximum age.
             created_at = p.get("pool_created_at")
 
@@ -1701,8 +1730,8 @@ def scan() -> None:
                         f"[{index:02d}] {name} "
                         f"| {p['source_type']} "
                         f"| too new "
-                        f"({age_days:.1f}d < "
-                        f"{MIN_POOL_AGE_DAYS:.0f}d)"
+                        f"({age_days * 24:.1f}h < "
+                        f"{MIN_POOL_AGE_DAYS * 24:.0f}h)"
                     )
                     continue
             else:
