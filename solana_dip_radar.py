@@ -559,7 +559,8 @@ def scan():
 
         try:
             candles = get_ohlcv(p["pool_address"])
-
+          
+        recent_candles = get_recent_ohlcv(p["pool_address"])
         if len(recent_candles) >= 6:
             old_price = safe_float(recent_candles[-1][4])
             recent_price = safe_float(recent_candles[0][4])
