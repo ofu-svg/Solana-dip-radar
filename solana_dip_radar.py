@@ -559,17 +559,14 @@ def scan():
 
         try:
             candles = get_ohlcv(p["pool_address"])
-          
-          recent_candles = get_recent_ohlcv(p["pool_address"])
-if len(recent_candles) >= 6:
-    old_price = safe_float(recent_candles[-1][4])
-    recent_price = safe_float(recent_candles[0][4])
-    if old_price and recent_price and recent_price > old_price * 1.05:
-        continue
-      
-            ath, ath_ts = calculate_ath(candles)
-            if not ath or not p["price"]:
+
+        if len(recent_candles) >= 6:
+            old_price = safe_float(recent_candles[-1][4])
+            recent_price = safe_float(recent_candles[0][4])
+            if old_price and recent_price and recent_price > old_price * 1.05:
                 continue
+
+        ath, ath_ts = calculate_ath(candles)
 
             dd = drawdown_percent(p["price"], ath)
             threshold = threshold_for(dd)
