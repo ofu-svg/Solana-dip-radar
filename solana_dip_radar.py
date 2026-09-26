@@ -109,13 +109,46 @@ def init_db() -> sqlite3.Connection:
     return conn
 
 
-def get_json(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+def get_json(path: str, params: dict[str, Any]) -> dict[str, Any]:
     url = f"{BASE_URL}{path}"
-    r = session.get(url, params=params, timeout=25)
-    if r.status_code == 429:
-        raise RuntimeError("GeckoTerminal rate limit reached (HTTP 429).")
-    r.raise_for_status()
-    return r.json()
+
+    for attempt in range(4):
+        try:
+            r = session.get(url, params=params, timeout=30)
+
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After")
+
+                if retry_after:
+                    try:
+                        wait = min(float(retry_after), 30)
+                    except ValueError:
+                        wait = 5.0
+                else:
+                    wait = min(5.0 * (attempt + 1), 20.0)
+
+                print(
+                    f"[WARN] GeckoTerminal rate limit (429). "
+                    f"Waiting {wait:.1f}s before retry {attempt + 1}/4..."
+                )
+                time.sleep(wait)
+                continue
+
+            r.raise_for_status()
+            return r.json()
+
+        except requests.RequestException as e:
+            if attempt >= 3:
+                raise
+
+            wait = min(3.0 * (attempt + 1), 12.0)
+            print(
+                f"[WARN] API request failed: {e}. "
+                f"Retrying in {wait:.1f}s..."
+            )
+            time.sleep(wait)
+
+    raise RuntimeError("GeckoTerminal API request failed after retries.")
 
 
 def get_pool_list(path: str, pages: int) -> list[dict[str, Any]]:
