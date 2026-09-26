@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-SOLANA DIP RADAR v3 — 48H / ALL AVAILABLE POOLS
+SOLANA DIP RADAR v4 — 48H / 20 VERIFIED POOLS MAX
 
 Rules:
 - Minimum pool age: 48 hours.
 - No maximum age.
-- No artificial 30/50/100 candidate cap.
+- Maximum of 20 fully verified pools are analyzed.
 - Paginate through all Solana pools available from GeckoTerminal.
 - Dip alerts: -30% or worse only.
 - Pump alerts: strictly above +100% only.
@@ -58,12 +58,13 @@ REQUIRE_METADATA_IMMUTABLE = (
 MIN_POOL_AGE_DAYS = float(os.getenv("MIN_POOL_AGE_DAYS", "2"))
 
 # 0 means no artificial page limit.
-MAX_POOL_PAGES = int(os.getenv("MAX_POOL_PAGES", "0"))
+MAX_POOL_PAGES = int(os.getenv("MAX_POOL_PAGES", "0"))  # Discovery only; full analysis is capped at 20
+MAX_VERIFIED_POOLS = 20  # HARD CAP: never fully analyze more than 20 verified pools
 
 # Keep these modest so obvious dust pools are ignored.
 MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY_USD", "300"))
 MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H_USD", "30"))
-MIN_TX_24H = int(os.getenv("MIN_TX_24H", "10"))
+MIN_TX_24H = 3  # At least 10 transactions in 24h
 
 # Alert thresholds
 MIN_DIP_ALERT = 30.0
@@ -1231,9 +1232,11 @@ def scan():
     print("=" * 72)
     print("SOLANA DIP RADAR v3")
     print(f"Started: {started}")
-    print("ALL AVAILABLE SOLANA POOLS: PAGINATED / NO FIXED CANDIDATE CAP")
+    print("SOLANA POOLS: PAGINATED DISCOVERY / MAX 20 VERIFIED POOLS ANALYZED")
     print("MINIMUM POOL AGE: >= 48 HOURS")
     print("NO MAXIMUM AGE")
+    print("MAX VERIFIED POOLS: 20")
+    print("MINIMUM 24H TRANSACTIONS: 10")
     print("DEV HOLDING FILTER: <= 5% REQUIRED")
     print("MINT AUTHORITY: MUST BE REVOKED")
     print("METADATA: MUST BE IMMUTABLE")
@@ -1265,7 +1268,14 @@ def scan():
     )
     print("")
 
+    verified_count = 0
+
     for index, p in enumerate(candidates, start=1):
+        # HARD STOP: after 20 pools have passed all filters and have
+        # usable OHLCV data, do not fully analyze another pool.
+        if verified_count >= MAX_VERIFIED_POOLS:
+            print(f"\n[INFO] 20 verified pools reached. Stopping full scan.")
+            break
         name = p["symbol"] or p["pool_name"] or "UNKNOWN"
 
         try:
@@ -1361,6 +1371,15 @@ def scan():
                     "not enough candles"
                 )
                 continue
+
+            verified_count += 1
+            print(
+                f"[VERIFIED {verified_count:02d}/{MAX_VERIFIED_POOLS}] "
+                f"{name} | {p['source_type']} | "
+                f"age {format_age(p['pool_created_at'])} | "
+                f"tx24h {p['tx_24h']} | "
+                f"liq {fmt_usd(p['liquidity'])}"
+            )
 
             latest_price = rows[-1][1]
             p["price"] = latest_price
@@ -1520,6 +1539,10 @@ def scan():
                 f"[{index:04d}] ERROR {name}: "
                 f"{type(exc).__name__}: {exc}"
             )
+
+    print(
+        f"\nVerified pools fully analyzed: {verified_count}/{MAX_VERIFIED_POOLS}"
+    )
 
     conn.close()
 
