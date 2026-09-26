@@ -905,8 +905,8 @@ def scan():
                 ath_ts,
                 dd,
                 security,
-            )
-
+False,
+)
             if not should_alert(
                 conn,
                 p,
