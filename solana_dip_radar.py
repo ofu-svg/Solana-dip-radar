@@ -908,11 +908,10 @@ def scan():
 False,
 )
             if not should_alert(
-                conn,
-                p,
-                symbol,
-                alert_key,
-            ):
+    conn,
+    p["pool_address"],
+    alert_key,
+):
                 print(
                     f"[{i:02d}] {symbol}: "
                     f"{alert_key} already alerted"
