@@ -1330,10 +1330,11 @@ def scan():
                 )
                 continue
 
-            verified_count += 1
+            analyzed_count += 1
 
+            
             print(
-                f"[VERIFIED {verified_count:02d}/{MAX_VERIFIED_POOLS}] "
+                f"[ANALYZED {analyzed_count:02d}/{MAX_ANALYZED_POOLS}] "
                 f"{name} | {p['source_type']} | "
                 f"age {format_age(p['pool_created_at'])} | "
                 f"tx24h {p['tx_24h']} | "
