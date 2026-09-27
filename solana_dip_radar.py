@@ -188,6 +188,7 @@ def format_duration(seconds: int) -> str:
 # SOLANA RPC / SAFETY
 # =========================
 
+
 def solana_rpc(method: str, params: list[Any]) -> Any:
     payload = {
         "jsonrpc": "2.0",
@@ -195,16 +196,61 @@ def solana_rpc(method: str, params: list[Any]) -> Any:
         "method": method,
         "params": params,
     }
-    response = solana_session.post(
-        SOLANA_RPC_URL,
-        json=payload,
-        timeout=30,
+
+    max_retries = 5
+
+    for attempt in range(max_retries):
+        try:
+            response = solana_session.post(
+                SOLANA_RPC_URL,
+                json=payload,
+                timeout=30,
+            )
+
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+
+                try:
+                    wait_time = float(retry_after)
+                except (TypeError, ValueError):
+                    wait_time = min(30, 2 ** attempt)
+
+                print(
+                    f"[WARN] Solana RPC rate limit (429). "
+                    f"Waiting {wait_time:.1f}s before retry "
+                    f"({attempt + 1}/{max_retries})..."
+                )
+
+                time.sleep(wait_time)
+                continue
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            if data.get("error"):
+                raise RuntimeError(
+                    f"Solana RPC {method}: {data['error']}"
+                )
+
+            return data.get("result")
+
+        except requests.RequestException as exc:
+            if attempt >= max_retries - 1:
+                raise
+
+            wait_time = min(30, 2 ** attempt)
+
+            print(
+                f"[WARN] Solana RPC request failed: {exc}. "
+                f"Retrying in {wait_time}s..."
+            )
+
+            time.sleep(wait_time)
+
+    raise RuntimeError(
+        f"Solana RPC {method} failed after {max_retries} attempts"
     )
-    response.raise_for_status()
-    data = response.json()
-    if data.get("error"):
-        raise RuntimeError(f"Solana RPC {method}: {data['error']}")
-    return data.get("result")
 
 
 def get_mint_info(mint: str) -> dict[str, Any]:
