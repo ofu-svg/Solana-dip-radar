@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-SOLANA DIP RADAR v4 — 48H / 20 VERIFIED POOLS MAX
+SOLANA DIP RADAR v5 — 48H / 20 VERIFIED POOLS MAX
 
 Rules:
 - Minimum pool age: 48 hours.
 - No maximum age.
 - Maximum of 20 fully verified pools are analyzed.
-- Paginate through all Solana pools available from GeckoTerminal.
-- Dip alerts: -30% or worse only.
-- Pump alerts: strictly above +100% only.
+- Selected Solana DEX pool venues are scanned.
+- Liquidity, 24h volume, and 24h transaction count do NOT filter pools.
+- Metadata immutability is NOT required.
 - Dev/team holding must be <= 5%.
 - Mint authority must be revoked (not mintable).
-- Metaplex metadata must be immutable.
-- If a safety check cannot be verified, reject the token.
+- If a required safety check cannot be verified, reject the token.
+- Dip alerts: -30% or worse only.
+- Pump alerts: strictly above +100% only.
 """
 
 from __future__ import annotations
@@ -50,16 +51,13 @@ REQUIRE_MINT_AUTHORITY_REVOKED = (
     os.getenv("REQUIRE_MINT_AUTHORITY_REVOKED", "true").lower() == "true"
 )
 
-REQUIRE_METADATA_IMMUTABLE = (
-    os.getenv("REQUIRE_METADATA_IMMUTABLE", "true").lower() == "true"
-)
+# Metadata immutability is intentionally NOT required.
+REQUIRE_METADATA_IMMUTABLE = False
 
 # Pool age: minimum 48 hours. NO maximum age.
 MIN_POOL_AGE_DAYS = float(os.getenv("MIN_POOL_AGE_DAYS", "2"))
 
 # Only selected real Solana DEX pool venues.
-# Phantom is a wallet/trading interface and DEXTools is an analytics platform,
-# so neither is treated as a pool venue here.
 SOLANA_DEX_IDS = [
     "raydium",
     "raydium-clmm",
@@ -72,12 +70,12 @@ SOLANA_DEX_IDS = [
 
 # Discovery is deliberately bounded to reduce GeckoTerminal 429s.
 DEX_PAGES_PER_SOURCE = int(os.getenv("DEX_PAGES_PER_SOURCE", "3"))
-MAX_VERIFIED_POOLS = 20  # HARD CAP: never fully analyze more than 20 verified pools
+MAX_VERIFIED_POOLS = 20
 
-# Keep these modest so obvious dust pools are ignored.
-MIN_LIQUIDITY = float(os.getenv("MIN_LIQUIDITY_USD", "300"))
-MIN_VOLUME_24H = float(os.getenv("MIN_VOLUME_24H_USD", "30"))
-MIN_TX_24H = int(os.getenv("MIN_TX_24H", "3"))  # At least 3 transactions in 24h
+# NO liquidity / volume / transaction filters.
+MIN_LIQUIDITY = 0.0
+MIN_VOLUME_24H = 0.0
+MIN_TX_24H = 0
 
 # Alert thresholds
 MIN_DIP_ALERT = 30.0
@@ -98,7 +96,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 HEADERS = {
     "accept": "application/json;version=20230203",
-    "user-agent": "SolanaDipRadar/3.0",
+    "user-agent": "SolanaDipRadar/5.0",
 }
 
 session = requests.Session()
@@ -108,7 +106,7 @@ solana_session = requests.Session()
 solana_session.headers.update({
     "accept": "application/json",
     "content-type": "application/json",
-    "user-agent": "SolanaDipRadar/3.0",
+    "user-agent": "SolanaDipRadar/5.0",
 })
 
 _last_gt_request = 0.0
@@ -187,7 +185,6 @@ def format_duration(seconds: int) -> str:
 # =========================
 # SOLANA RPC / SAFETY
 # =========================
-
 
 def solana_rpc(method: str, params: list[Any]) -> Any:
     payload = {
@@ -356,12 +353,6 @@ def metadata_pda(mint: str) -> str:
 
 
 def read_metadata(mint: str) -> tuple[str | None, bool | None, list[str]]:
-    """
-    Returns:
-      update_authority, is_mutable, creator_addresses
-
-    Fail closed if metadata cannot be decoded.
-    """
     try:
         pda = metadata_pda(mint)
 
@@ -387,12 +378,10 @@ def read_metadata(mint: str) -> tuple[str | None, bool | None, list[str]]:
         if len(raw) < 65:
             return None, None, []
 
-        offset += 1  # key
-
+        offset += 1
         update_authority = base58_encode(raw[offset:offset + 32])
         offset += 32
-
-        offset += 32  # mint
+        offset += 32
 
         def read_borsh_string(buf: bytes, pos: int):
             if pos + 4 > len(buf):
@@ -405,11 +394,11 @@ def read_metadata(mint: str) -> tuple[str | None, bool | None, list[str]]:
             pos += length
             return value, pos
 
-        _, offset = read_borsh_string(raw, offset)  # name
-        _, offset = read_borsh_string(raw, offset)  # symbol
-        _, offset = read_borsh_string(raw, offset)  # uri
+        _, offset = read_borsh_string(raw, offset)
+        _, offset = read_borsh_string(raw, offset)
+        _, offset = read_borsh_string(raw, offset)
 
-        offset += 2  # seller fee
+        offset += 2
 
         if offset >= len(raw):
             return None, None, []
@@ -429,25 +418,23 @@ def read_metadata(mint: str) -> tuple[str | None, bool | None, list[str]]:
                 if offset + 35 > len(raw):
                     return None, None, []
                 creators.append(base58_encode(raw[offset:offset + 32]))
-                offset += 35  # pubkey + verified + share
+                offset += 35
 
-        # collection Option<Collection>
         if offset >= len(raw):
             return None, None, []
         collection_option = raw[offset]
         offset += 1
 
         if collection_option == 1:
-            offset += 33  # verified + key
+            offset += 33
 
-        # uses Option<Uses>
         if offset >= len(raw):
             return None, None, []
         uses_option = raw[offset]
         offset += 1
 
         if uses_option == 1:
-            offset += 17  # use_method + remaining + total
+            offset += 17
 
         if offset >= len(raw):
             return None, None, []
@@ -514,9 +501,7 @@ def safety_check_token(mint: str) -> tuple[bool, dict[str, Any], str]:
         details["metadata_mutable"] = is_mutable
         details["creator_addresses"] = creators
 
-        if REQUIRE_METADATA_IMMUTABLE:
-            if is_mutable is not False:
-                return False, details, "metadata mutable or unverified"
+        # Metadata immutability is not required in this version.
 
         dev_pct = get_dev_holding_percent(
             mint,
@@ -749,70 +734,7 @@ def parse_pool(item: dict[str, Any], source_type: str) -> dict[str, Any]:
     }
 
 
-def discover_all_pools(
-    endpoint: str,
-    params: dict[str, Any],
-    source_type: str,
-) -> list[dict[str, Any]]:
-
-    results = []
-    page = 1
-
-    while True:
-        if MAX_POOL_PAGES > 0 and page > MAX_POOL_PAGES:
-            print(
-                f"[INFO] {source_type}: stopped at configured "
-                f"MAX_POOL_PAGES={MAX_POOL_PAGES}"
-            )
-            break
-
-        query = dict(params)
-        query["page"] = page
-
-        try:
-            payload = get_json(endpoint, query)
-        except Exception as exc:
-            print(
-                f"[WARN] {source_type}: discovery stopped at "
-                f"page {page}: {exc}"
-            )
-            break
-
-        data = payload.get("data", []) or []
-
-        if not data:
-            print(
-                f"[INFO] {source_type}: finished at page {page - 1}"
-            )
-            break
-
-        for item in data:
-            results.append(parse_pool(item, source_type))
-
-        print(
-            f"[INFO] {source_type}: page {page} "
-            f"({len(data)} pools)"
-        )
-
-        # GeckoTerminal commonly returns a partial final page.
-        if len(data) < 20:
-            print(
-                f"[INFO] {source_type}: final partial page reached"
-            )
-            break
-
-        page += 1
-
-    return results
-
-
 def discover_candidates() -> list[dict[str, Any]]:
-    """Discover pools only from selected Solana DEX venues.
-
-    We deliberately do NOT crawl the entire Solana network.
-    Pools older than 7 days are allowed; only pools younger than 48 hours
-    are rejected later during the hard age filter.
-    """
     print(
         "[INFO] Scanning selected Solana DEX pool sources only: "
         + ", ".join(SOLANA_DEX_IDS)
@@ -1040,7 +962,6 @@ def build_alert_key(
 ):
     levels = []
 
-    # ONLY -30% OR WORSE.
     if change_15m is not None and change_15m <= -MIN_DIP_ALERT:
         levels.append("DIP_15M_30")
 
@@ -1060,7 +981,6 @@ def build_alert_key(
         elif drawdown_24h >= MIN_DIP_ALERT:
             levels.append("DIP_30")
 
-    # ONLY STRICTLY ABOVE +100%.
     if up_1h is not None and up_1h > PUMP_1H:
         levels.append("PUMP100+")
 
@@ -1235,6 +1155,16 @@ def alert_message(
     if "PUMP100+" in alert_key and "DIP_" not in alert_key:
         title = "🚀 SOLANA PUMP ALERT"
 
+    metadata_value = p.get("metadata_mutable")
+    metadata_text = (
+        "YES" if metadata_value is True
+        else "NO" if metadata_value is False
+        else "UNKNOWN"
+    )
+
+    mint_authority = p.get("mint_authority")
+    mint_text = "REVOKED" if mint_authority is None else "ACTIVE"
+
     lines = [
         title,
         "",
@@ -1280,8 +1210,8 @@ def alert_message(
         f"24h transactions: {p['tx_24h']}",
         f"DEX: {p['dex'] or 'unknown'}",
         f"Dev holdings: {p.get('dev_holding_percent', 0):.2f}% (MAX 5%)",
-        "Metadata mutable: NO",
-        "Mint authority: REVOKED",
+        f"Metadata mutable: {metadata_text}",
+        f"Mint authority: {mint_text}",
         f"Signal: {alert_key}",
         "",
         f"Mint: {p['token_address'] or 'unknown'}",
@@ -1315,10 +1245,12 @@ def scan():
     print("MINIMUM POOL AGE: >= 48 HOURS")
     print("NO MAXIMUM AGE")
     print("MAX VERIFIED POOLS: 20")
-    print(f"MINIMUM 24H TRANSACTIONS: {MIN_TX_24H}")
+    print("LIQUIDITY FILTER: NONE")
+    print("24H VOLUME FILTER: NONE")
+    print("24H TRANSACTION FILTER: NONE")
     print("DEV HOLDING FILTER: <= 5% REQUIRED")
     print("MINT AUTHORITY: MUST BE REVOKED")
-    print("METADATA: MUST BE IMMUTABLE")
+    print("METADATA IMMUTABILITY: NOT REQUIRED")
     print("MINIMUM DIP ALERT: -30%")
     print("PUMP ALERT: > +100% ONLY")
     print("DIPS: -30% OR WORSE ONLY")
@@ -1350,15 +1282,13 @@ def scan():
     verified_count = 0
 
     for index, p in enumerate(candidates, start=1):
-        # HARD STOP: after 20 pools have passed all filters and have
-        # usable OHLCV data, do not fully analyze another pool.
         if verified_count >= MAX_VERIFIED_POOLS:
-            print(f"\n[INFO] 20 verified pools reached. Stopping full scan.")
+            print("\n[INFO] 20 verified pools reached. Stopping full scan.")
             break
+
         name = p["symbol"] or p["pool_name"] or "UNKNOWN"
 
         try:
-            # HARD 48-HOUR AGE FILTER.
             created_at = p.get("pool_created_at")
 
             if not created_at:
@@ -1379,31 +1309,11 @@ def scan():
                 continue
 
             if p["price"] is None:
-                print(
-                    f"[{index:04d}] {name} | NO PRICE"
-                )
+                print(f"[{index:04d}] {name} | NO PRICE")
                 continue
 
-            if (p["liquidity"] or 0) < MIN_LIQUIDITY:
-                print(
-                    f"[{index:04d}] {name} | "
-                    f"low liquidity {fmt_usd(p['liquidity'])}"
-                )
-                continue
-
-            if (p["volume_24h"] or 0) < MIN_VOLUME_24H:
-                print(
-                    f"[{index:04d}] {name} | "
-                    f"low 24h volume {fmt_usd(p['volume_24h'])}"
-                )
-                continue
-
-            if p["tx_24h"] < MIN_TX_24H:
-                print(
-                    f"[{index:04d}] {name} | "
-                    f"low transactions {p['tx_24h']}"
-                )
-                continue
+            # Liquidity, volume and transaction count are intentionally
+            # NOT used as filters in this version.
 
             if not p["token_address"]:
                 print(
@@ -1412,7 +1322,6 @@ def scan():
                 )
                 continue
 
-            # HARD SAFETY FILTERS BEFORE OHLCV.
             safety_ok, safety_details, safety_reason = (
                 safety_check_token(p["token_address"])
             )
@@ -1452,6 +1361,7 @@ def scan():
                 continue
 
             verified_count += 1
+
             print(
                 f"[VERIFIED {verified_count:02d}/{MAX_VERIFIED_POOLS}] "
                 f"{name} | {p['source_type']} | "
@@ -1509,7 +1419,6 @@ def scan():
                 up_value,
             )
 
-            # SILENT for ordinary movements.
             if not alert_key:
                 save_scan(
                     conn,
@@ -1532,23 +1441,22 @@ def scan():
                 )
                 continue
 
-            print(
-                f"[{index:04d}] 🚨 ALERT | "
-                f"{name} / {p['source_type']} | "
-                f"15m "
-                f"{change_15m:+.2f}%"
-                if change_15m is not None
-                else
-                f"[{index:04d}] 🚨 ALERT | "
-                f"{name} / {p['source_type']} | 15m n/a",
-                end="",
-            )
-
-            if change_1h is not None:
+            if change_15m is not None:
                 print(
-                    f" | 1h {change_1h:+.2f}%",
+                    f"[{index:04d}] 🚨 ALERT | "
+                    f"{name} / {p['source_type']} | "
+                    f"15m {change_15m:+.2f}%",
                     end="",
                 )
+            else:
+                print(
+                    f"[{index:04d}] 🚨 ALERT | "
+                    f"{name} / {p['source_type']} | 15m n/a",
+                    end="",
+                )
+
+            if change_1h is not None:
+                print(f" | 1h {change_1h:+.2f}%", end="")
 
             if drawdown_24h is not None:
                 print(
@@ -1605,13 +1513,9 @@ def scan():
             )
 
             if sent:
-                print(
-                    f"       🚨 ALERT SENT: {alert_key}"
-                )
+                print(f"       🚨 ALERT SENT: {alert_key}")
             else:
-                print(
-                    f"       ⚠️ Signal found: {alert_key}"
-                )
+                print(f"       ⚠️ Signal found: {alert_key}")
 
         except Exception as exc:
             print(
@@ -1620,7 +1524,8 @@ def scan():
             )
 
     print(
-        f"\nVerified pools fully analyzed: {verified_count}/{MAX_VERIFIED_POOLS}"
+        f"\nVerified pools fully analyzed: "
+        f"{verified_count}/{MAX_VERIFIED_POOLS}"
     )
 
     conn.close()
