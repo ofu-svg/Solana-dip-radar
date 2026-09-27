@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-SOLANA DIP RADAR v5 — 48H / 20 VERIFIED POOLS MAX
+SOLANA DIP RADAR v6 — 48H / 20 POOLS MAX
 
 Rules:
 - Minimum pool age: 48 hours.
 - No maximum age.
-- Maximum of 20 fully verified pools are analyzed.
+- Maximum of 20 eligible pools are analyzed.
 - Selected Solana DEX pool venues are scanned.
 - Liquidity, 24h volume, and 24h transaction count do NOT filter pools.
 - Metadata immutability is NOT required.
-- Dev/team holding must be <= 5%.
-- Mint authority must be revoked (not mintable).
-- If a required safety check cannot be verified, reject the token.
+- Custom token safety verification is NOT used as a pool gate in this test version.
 - Dip alerts: -30% or worse only.
 - Pump alerts: strictly above +100% only.
 """
@@ -70,7 +68,7 @@ SOLANA_DEX_IDS = [
 
 # Discovery is deliberately bounded to reduce GeckoTerminal 429s.
 DEX_PAGES_PER_SOURCE = int(os.getenv("DEX_PAGES_PER_SOURCE", "3"))
-MAX_VERIFIED_POOLS = 20
+MAX_ANALYZED_POOLS = 20
 
 # NO liquidity / volume / transaction filters.
 MIN_LIQUIDITY = 0.0
@@ -1209,9 +1207,9 @@ def alert_message(
         f"24h volume: {fmt_usd(p['volume_24h'])}",
         f"24h transactions: {p['tx_24h']}",
         f"DEX: {p['dex'] or 'unknown'}",
-        f"Dev holdings: {p.get('dev_holding_percent', 0):.2f}% (MAX 5%)",
-        f"Metadata mutable: {metadata_text}",
-        f"Mint authority: {mint_text}",
+        "Dev holdings: NOT CHECKED",
+        "Metadata mutable: NOT CHECKED",
+        "Mint authority: NOT CHECKED",
         f"Signal: {alert_key}",
         "",
         f"Mint: {p['token_address'] or 'unknown'}",
@@ -1241,15 +1239,14 @@ def scan():
     print("=" * 72)
     print("SOLANA DIP RADAR v5")
     print(f"Started: {started}")
-    print("SOLANA POOLS: SELECTED DEX SOURCES ONLY / MAX 20 VERIFIED POOLS")
+    print("SOLANA POOLS: SELECTED DEX SOURCES ONLY / MAX 20 POOLS")
     print("MINIMUM POOL AGE: >= 48 HOURS")
     print("NO MAXIMUM AGE")
-    print("MAX VERIFIED POOLS: 20")
+    print("MAX ANALYZED POOLS: 20")
     print("LIQUIDITY FILTER: NONE")
     print("24H VOLUME FILTER: NONE")
     print("24H TRANSACTION FILTER: NONE")
-    print("DEV HOLDING FILTER: <= 5% REQUIRED")
-    print("MINT AUTHORITY: MUST BE REVOKED")
+    print("CUSTOM TOKEN SAFETY VERIFICATION: NOT REQUIRED")
     print("METADATA IMMUTABILITY: NOT REQUIRED")
     print("MINIMUM DIP ALERT: -30%")
     print("PUMP ALERT: > +100% ONLY")
@@ -1279,11 +1276,11 @@ def scan():
     )
     print("")
 
-    verified_count = 0
+    analyzed_count = 0
 
     for index, p in enumerate(candidates, start=1):
-        if verified_count >= MAX_VERIFIED_POOLS:
-            print("\n[INFO] 20 verified pools reached. Stopping full scan.")
+        if analyzed_count >= MAX_ANALYZED_POOLS:
+            print("\n[INFO] 20 pools analyzed. Stopping full scan.")
             break
 
         name = p["symbol"] or p["pool_name"] or "UNKNOWN"
@@ -1322,34 +1319,13 @@ def scan():
                 )
                 continue
 
-            safety_ok, safety_details, safety_reason = (
-                safety_check_token(p["token_address"])
-            )
-
-            if not safety_ok:
-                print(
-                    f"[{index:04d}] FILTERED {name} | "
-                    f"{safety_reason}"
-                )
-                save_scan(
-                    conn,
-                    p,
-                    None,
-                    None,
-                    None,
-                    f"FILTERED: {safety_reason}",
-                )
-                continue
-
-            p["dev_holding_percent"] = (
-                safety_details["dev_holding_percent"]
-            )
-            p["metadata_mutable"] = (
-                safety_details["metadata_mutable"]
-            )
-            p["mint_authority"] = (
-                safety_details["mint_authority"]
-            )
+            # Diagnostic mode: do NOT require the custom safety-check
+            # / "verified pool" gate. This lets eligible pools reach
+            # OHLCV and alert evaluation so we can identify the real
+            # Telegram-alert bottleneck.
+            p["dev_holding_percent"] = None
+            p["metadata_mutable"] = None
+            p["mint_authority"] = None
 
             rows = get_15m_candles(p["pool_address"])
 
@@ -1524,8 +1500,8 @@ def scan():
             )
 
     print(
-        f"\nVerified pools fully analyzed: "
-        f"{verified_count}/{MAX_VERIFIED_POOLS}"
+        f"\nPools fully analyzed: "
+        f"{analyzed_count}/{MAX_ANALYZED_POOLS}"
     )
 
     conn.close()
