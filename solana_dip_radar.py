@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SOLANA DIP RADAR v6 — BROAD ACTIVE RED DIP RADAR
+SOLANA DIP RADAR v6.1 — FAST BROAD ACTIVE RED DIP RADAR
 
 Core alert rule:
 - Track eligible Solana pools continuously during each scan.
@@ -15,7 +15,7 @@ Core alert rule:
 Existing pool/safety configuration is preserved:
 - Minimum pool age: 48 hours.
 - No maximum age.
-- Maximum 20 analyzed pools per scan.
+- Fast mode: maximum 60 analyzed pools per scan.
 - Selected Solana DEX pool venues.
 - No liquidity/volume/transaction filters.
 - Custom token safety gate is not required.
@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import os
 import sqlite3
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -36,6 +37,12 @@ import requests
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Make GitHub Actions show scanner output immediately instead of buffering it.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
 BASE_URL = os.getenv("GT_BASE_URL", "https://api.geckoterminal.com/api/v2")
 NETWORK = "solana"
@@ -63,9 +70,9 @@ SOLANA_DEX_IDS = [
     "pumpswap",
 ]
 
-DEX_PAGES_PER_SOURCE = int(os.getenv("DEX_PAGES_PER_SOURCE", "20"))
-MAX_DISCOVERED_POOLS = int(os.getenv("MAX_DISCOVERED_POOLS", "2500"))
-MAX_ANALYZED_POOLS = int(os.getenv("MAX_ANALYZED_POOLS", "1000"))
+DEX_PAGES_PER_SOURCE = int(os.getenv("DEX_PAGES_PER_SOURCE", "5"))
+MAX_DISCOVERED_POOLS = int(os.getenv("MAX_DISCOVERED_POOLS", "700"))
+MAX_ANALYZED_POOLS = int(os.getenv("MAX_ANALYZED_POOLS", "60"))
 POOL_PAGE_SIZE = int(os.getenv("POOL_PAGE_SIZE", "20"))
 MAX_EMPTY_PAGES_PER_DEX = int(os.getenv("MAX_EMPTY_PAGES_PER_DEX", "2"))
 DEX_SCAN_MODE = os.getenv("DEX_SCAN_MODE", "all").strip().lower()
@@ -84,8 +91,8 @@ DEEP_DIP_ALERT = 50.0
 EXTREME_DIP_ALERT = 90.0
 ULTRA_DIP_ALERT = 99.0
 
-REQUEST_INTERVAL = float(os.getenv("REQUEST_INTERVAL", "6.5"))
-MAX_RETRIES = 3
+REQUEST_INTERVAL = float(os.getenv("REQUEST_INTERVAL", "2.5"))
+MAX_RETRIES = 2
 ALERT_COOLDOWN_HOURS = float(os.getenv("ALERT_COOLDOWN_HOURS", "12"))
 
 DB_PATH = os.getenv("DB_PATH", "solana_dip_radar_v3.sqlite3")
@@ -562,7 +569,7 @@ def get_json(path: str, params: dict[str, Any] | None = None):
                     retry_wait = float(retry_after)
                 except (TypeError, ValueError):
                     retry_wait = 15.0
-                retry_wait = max(10.0, min(retry_wait, 60.0))
+                retry_wait = max(5.0, min(retry_wait, 20.0))
                 print(f"[WARN] GeckoTerminal 429. Waiting {retry_wait:.0f}s...")
                 time.sleep(retry_wait)
                 continue
@@ -1114,11 +1121,13 @@ def scan():
     print("SOLANA DIP RADAR v6 — BROAD ACTIVE RED DIP RADAR")
     print(f"Started: {started}")
     print("MINIMUM POOL AGE: >= 48 HOURS")
+    print("FAST MODE: LIMITED DISCOVERY + LIMITED OHLCV REQUESTS")
     print("NO MAXIMUM AGE")
     print(f"MAX DISCOVERED POOLS: {MAX_DISCOVERED_POOLS}")
     print(f"MAX ANALYZED POOLS: {MAX_ANALYZED_POOLS}")
     print(f"DEX PAGES PER SOURCE: {DEX_PAGES_PER_SOURCE}")
-    print("BROAD POOL DISCOVERY: ENABLED")
+    print(f"REQUEST INTERVAL: {REQUEST_INTERVAL:.1f}s")
+    print("BROAD POOL DISCOVERY: ENABLED (FAST PAGINATED MODE)")
     print("DIP ALERT: CURRENT PRICE >= 30% BELOW OBSERVED 24H HIGH")
     print("CURRENT CANDLE MUST BE RED")
     print("GREEN CANDLE: NEVER ALERT")
@@ -1140,8 +1149,7 @@ def scan():
         + " | ".join(f"{k}: {v}" for k, v in sorted(source_counts.items()))
     )
     print(
-        f"API spacing: {REQUEST_INTERVAL:.1f}s "
-        "(deliberately slow to reduce 429 errors)"
+        f"API spacing: {REQUEST_INTERVAL:.1f}s (fast rate-limited mode)"
     )
     print("")
 
@@ -1152,7 +1160,7 @@ def scan():
 
     for index, p in enumerate(candidates, start=1):
         if analyzed_count >= MAX_ANALYZED_POOLS:
-            print("\n[INFO] 20 pools analyzed. Stopping full scan.")
+            print(f"\n[INFO] {MAX_ANALYZED_POOLS} pools analyzed. Stopping full scan.")
             break
 
         name = p["symbol"] or p["pool_name"] or "UNKNOWN"
