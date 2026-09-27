@@ -5,12 +5,17 @@ on:
   schedule:
     - cron: "*/15 * * * *"
 
+
 permissions:
   contents: read
 
-jobs:
-  scan:
-    runs-on: ubuntu-latest
+concurrency:
+  group: solana-dip-radar
+  cancel-in-progress: true
+
+scan:
+  runs-on: ubuntu-latest
+  timeout-minutes: 10
 
     steps:
       - name: Checkout repository
@@ -29,4 +34,4 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SOLANA_RPC_URL: ${{ secrets.SOLANA_RPC_URL }}
-        run: python solana_dip_radar.py
+        run: python -u solana_dip_radar.py
