@@ -1,17 +1,25 @@
 #!/usr/bin/env python3
 """
-SOLANA DIP RADAR v6 — 48H / 20 POOLS MAX
+SOLANA DIP RADAR v6 — BROAD ACTIVE RED DIP RADAR
 
-Rules:
+Core alert rule:
+- Track eligible Solana pools continuously during each scan.
+- Alert only when the CURRENT 15-minute candle is RED (close < open).
+- Alert only when the current price is >=30% below the observed 24h high.
+- Zones: -30%, -50%, -90%, -99%+.
+- NEVER alert on a green candle.
+- NEVER alert merely because an old/historical drop occurred.
+- NEVER send pump alerts.
+- Recovery/green candles are ignored.
+
+Existing pool/safety configuration is preserved:
 - Minimum pool age: 48 hours.
 - No maximum age.
-- Maximum of 20 eligible pools are analyzed.
-- Selected Solana DEX pool venues are scanned.
-- Liquidity, 24h volume, and 24h transaction count do NOT filter pools.
-- Metadata immutability is NOT required.
-- Custom token safety verification is NOT used as a pool gate in this test version.
-- Dip alerts: -30% or worse only.
-- Pump alerts: strictly above +100% only.
+- Maximum 20 analyzed pools per scan.
+- Selected Solana DEX pool venues.
+- No liquidity/volume/transaction filters.
+- Custom token safety gate is not required.
+- Metadata immutability is not required.
 """
 
 from __future__ import annotations
@@ -37,25 +45,14 @@ SOLANA_RPC_URL = os.getenv(
     "https://api.mainnet-beta.solana.com",
 ).strip()
 
-# =========================
-# USER SAFETY FILTERS
-# =========================
-
-MAX_DEV_HOLDING_PERCENT = float(
-    os.getenv("MAX_DEV_HOLDING_PERCENT", "5")
-)
-
+MAX_DEV_HOLDING_PERCENT = float(os.getenv("MAX_DEV_HOLDING_PERCENT", "5"))
 REQUIRE_MINT_AUTHORITY_REVOKED = (
     os.getenv("REQUIRE_MINT_AUTHORITY_REVOKED", "true").lower() == "true"
 )
-
-# Metadata immutability is intentionally NOT required.
 REQUIRE_METADATA_IMMUTABLE = False
 
-# Pool age: minimum 48 hours. NO maximum age.
 MIN_POOL_AGE_DAYS = float(os.getenv("MIN_POOL_AGE_DAYS", "2"))
 
-# Only selected real Solana DEX pool venues.
 SOLANA_DEX_IDS = [
     "raydium",
     "raydium-clmm",
@@ -66,22 +63,26 @@ SOLANA_DEX_IDS = [
     "pumpswap",
 ]
 
-# Discovery is deliberately bounded to reduce GeckoTerminal 429s.
-DEX_PAGES_PER_SOURCE = int(os.getenv("DEX_PAGES_PER_SOURCE", "3"))
-MAX_ANALYZED_POOLS = 20
+DEX_PAGES_PER_SOURCE = int(os.getenv("DEX_PAGES_PER_SOURCE", "20"))
+MAX_DISCOVERED_POOLS = int(os.getenv("MAX_DISCOVERED_POOLS", "2500"))
+MAX_ANALYZED_POOLS = int(os.getenv("MAX_ANALYZED_POOLS", "1000"))
+POOL_PAGE_SIZE = int(os.getenv("POOL_PAGE_SIZE", "20"))
+MAX_EMPTY_PAGES_PER_DEX = int(os.getenv("MAX_EMPTY_PAGES_PER_DEX", "2"))
+DEX_SCAN_MODE = os.getenv("DEX_SCAN_MODE", "all").strip().lower()
+MIN_RED_CANDLE_PERCENT = float(os.getenv("MIN_RED_CANDLE_PERCENT", "0.10"))
+MAX_REBOUND_FROM_RECENT_LOW_PERCENT = float(
+    os.getenv("MAX_REBOUND_FROM_RECENT_LOW_PERCENT", "8.0")
+)
 
-# NO liquidity / volume / transaction filters.
 MIN_LIQUIDITY = 0.0
 MIN_VOLUME_24H = 0.0
 MIN_TX_24H = 0
 
-# Alert thresholds
+# ACTIVE DIP ALERTS
 MIN_DIP_ALERT = 30.0
-PUMP_1H = 100.0001
-
-DEEP_DIP_24H = 80.0
-EXTREME_DIP_24H = 95.0
-ULTRA_DIP_24H = 99.0
+DEEP_DIP_ALERT = 50.0
+EXTREME_DIP_ALERT = 90.0
+ULTRA_DIP_ALERT = 99.0
 
 REQUEST_INTERVAL = float(os.getenv("REQUEST_INTERVAL", "6.5"))
 MAX_RETRIES = 3
@@ -94,7 +95,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 HEADERS = {
     "accept": "application/json;version=20230203",
-    "user-agent": "SolanaDipRadar/5.0",
+    "user-agent": "SolanaDipRadar/6.0",
 }
 
 session = requests.Session()
@@ -104,15 +105,11 @@ solana_session = requests.Session()
 solana_session.headers.update({
     "accept": "application/json",
     "content-type": "application/json",
-    "user-agent": "SolanaDipRadar/5.0",
+    "user-agent": "SolanaDipRadar/6.0",
 })
 
 _last_gt_request = 0.0
 
-
-# =========================
-# HELPERS
-# =========================
 
 def now_ts() -> int:
     return int(time.time())
@@ -131,11 +128,9 @@ def parse_time(value: Any) -> int | None:
     if not value:
         return None
     try:
-        return int(
-            datetime.fromisoformat(
-                str(value).replace("Z", "+00:00")
-            ).timestamp()
-        )
+        return int(datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        ).timestamp())
     except Exception:
         return None
 
@@ -204,7 +199,6 @@ def solana_rpc(method: str, params: list[Any]) -> Any:
 
             if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
-
                 try:
                     wait_time = float(retry_after)
                 except (TypeError, ValueError):
@@ -215,48 +209,35 @@ def solana_rpc(method: str, params: list[Any]) -> Any:
                     f"Waiting {wait_time:.1f}s before retry "
                     f"({attempt + 1}/{max_retries})..."
                 )
-
                 time.sleep(wait_time)
                 continue
 
             response.raise_for_status()
-
             data = response.json()
 
             if data.get("error"):
-                raise RuntimeError(
-                    f"Solana RPC {method}: {data['error']}"
-                )
+                raise RuntimeError(f"Solana RPC {method}: {data['error']}")
 
             return data.get("result")
 
         except requests.RequestException as exc:
             if attempt >= max_retries - 1:
                 raise
-
             wait_time = min(30, 2 ** attempt)
-
             print(
                 f"[WARN] Solana RPC request failed: {exc}. "
                 f"Retrying in {wait_time}s..."
             )
-
             time.sleep(wait_time)
 
-    raise RuntimeError(
-        f"Solana RPC {method} failed after {max_retries} attempts"
-    )
+    raise RuntimeError(f"Solana RPC {method} failed after {max_retries} attempts")
 
 
 def get_mint_info(mint: str) -> dict[str, Any]:
     result = solana_rpc(
         "getAccountInfo",
-        [
-            mint,
-            {"encoding": "jsonParsed", "commitment": "confirmed"},
-        ],
+        [mint, {"encoding": "jsonParsed", "commitment": "confirmed"}],
     )
-
     value = (result or {}).get("value")
     if not value:
         raise RuntimeError("Mint account not found")
@@ -290,23 +271,13 @@ def get_token_accounts_for_owner(owner: str, mint: str) -> int:
     )
 
     total_raw = 0
-
     for item in (result or {}).get("value", []):
-        parsed = (
-            item.get("account", {})
-            .get("data", {})
-            .get("parsed", {})
-        )
-        amount = (
-            parsed.get("info", {})
-            .get("tokenAmount", {})
-            .get("amount")
-        )
+        parsed = item.get("account", {}).get("data", {}).get("parsed", {})
+        amount = parsed.get("info", {}).get("tokenAmount", {}).get("amount")
         try:
             total_raw += int(amount or 0)
         except (TypeError, ValueError):
             pass
-
     return total_raw
 
 
@@ -340,11 +311,7 @@ def metadata_pda(mint: str) -> str:
     mint_pubkey = Pubkey.from_string(mint)
 
     pda, _ = Pubkey.find_program_address(
-        [
-            b"metadata",
-            bytes(metadata_program),
-            bytes(mint_pubkey),
-        ],
+        [b"metadata", bytes(metadata_program), bytes(mint_pubkey)],
         metadata_program,
     )
     return str(pda)
@@ -353,13 +320,9 @@ def metadata_pda(mint: str) -> str:
 def read_metadata(mint: str) -> tuple[str | None, bool | None, list[str]]:
     try:
         pda = metadata_pda(mint)
-
         result = solana_rpc(
             "getAccountInfo",
-            [
-                pda,
-                {"encoding": "base64", "commitment": "confirmed"},
-            ],
+            [pda, {"encoding": "base64", "commitment": "confirmed"}],
         )
 
         value = (result or {}).get("value")
@@ -395,7 +358,6 @@ def read_metadata(mint: str) -> tuple[str | None, bool | None, list[str]]:
         _, offset = read_borsh_string(raw, offset)
         _, offset = read_borsh_string(raw, offset)
         _, offset = read_borsh_string(raw, offset)
-
         offset += 2
 
         if offset >= len(raw):
@@ -403,7 +365,6 @@ def read_metadata(mint: str) -> tuple[str | None, bool | None, list[str]]:
 
         creators_option = raw[offset]
         offset += 1
-
         creators = []
 
         if creators_option == 1:
@@ -422,7 +383,6 @@ def read_metadata(mint: str) -> tuple[str | None, bool | None, list[str]]:
             return None, None, []
         collection_option = raw[offset]
         offset += 1
-
         if collection_option == 1:
             offset += 33
 
@@ -430,16 +390,13 @@ def read_metadata(mint: str) -> tuple[str | None, bool | None, list[str]]:
             return None, None, []
         uses_option = raw[offset]
         offset += 1
-
         if uses_option == 1:
             offset += 17
 
         if offset >= len(raw):
             return None, None, []
 
-        is_mutable = bool(raw[offset])
-
-        return update_authority, is_mutable, creators
+        return update_authority, bool(raw[offset]), creators
 
     except Exception:
         return None, None, []
@@ -451,25 +408,20 @@ def get_dev_holding_percent(
     update_authority: str | None,
     creator_addresses: list[str],
 ) -> float | None:
-
     supply_raw = int(mint_info.get("supply_raw", 0))
     if supply_raw <= 0:
         return None
 
     owners = []
-
     for owner in creator_addresses:
         if owner and owner not in owners:
             owners.append(owner)
-
     if update_authority and update_authority not in owners:
         owners.append(update_authority)
-
     if not owners:
         return None
 
     total_raw = 0
-
     for owner in owners:
         try:
             total_raw += get_token_accounts_for_owner(owner, mint)
@@ -484,7 +436,6 @@ def safety_check_token(mint: str) -> tuple[bool, dict[str, Any], str]:
 
     try:
         mint_info = get_mint_info(mint)
-
         details["mint_authority"] = mint_info.get("mint_authority")
         details["freeze_authority"] = mint_info.get("freeze_authority")
         details["supply"] = mint_info.get("supply")
@@ -494,20 +445,13 @@ def safety_check_token(mint: str) -> tuple[bool, dict[str, Any], str]:
                 return False, details, "mintable (mint authority active)"
 
         update_authority, is_mutable, creators = read_metadata(mint)
-
         details["update_authority"] = update_authority
         details["metadata_mutable"] = is_mutable
         details["creator_addresses"] = creators
 
-        # Metadata immutability is not required in this version.
-
         dev_pct = get_dev_holding_percent(
-            mint,
-            mint_info,
-            update_authority,
-            creators,
+            mint, mint_info, update_authority, creators
         )
-
         details["dev_holding_percent"] = dev_pct
 
         if dev_pct is None:
@@ -578,14 +522,9 @@ def init_db() -> sqlite3.Connection:
 
 def previous_alert(conn, pool_address: str):
     row = conn.execute(
-        """
-        SELECT last_alert_key, last_alert_ts
-        FROM pools
-        WHERE pool_address = ?
-        """,
+        "SELECT last_alert_key, last_alert_ts FROM pools WHERE pool_address = ?",
         (pool_address,),
     ).fetchone()
-
     return (row[0], row[1]) if row else (None, None)
 
 
@@ -594,7 +533,6 @@ def alert_allowed(conn, pool_address: str, alert_key: str) -> bool:
 
     if not old_key or not old_ts:
         return True
-
     if old_key != alert_key:
         return True
 
@@ -607,25 +545,16 @@ def alert_allowed(conn, pool_address: str, alert_key: str) -> bool:
 
 def get_json(path: str, params: dict[str, Any] | None = None):
     global _last_gt_request
-
     url = f"{BASE_URL}{path}"
 
     for attempt in range(MAX_RETRIES):
-        wait = REQUEST_INTERVAL - (
-            time.monotonic() - _last_gt_request
-        )
-
+        wait = REQUEST_INTERVAL - (time.monotonic() - _last_gt_request)
         if wait > 0:
             time.sleep(wait)
 
         try:
             _last_gt_request = time.monotonic()
-
-            response = session.get(
-                url,
-                params=params or {},
-                timeout=30,
-            )
+            response = session.get(url, params=params or {}, timeout=30)
 
             if response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
@@ -633,13 +562,8 @@ def get_json(path: str, params: dict[str, Any] | None = None):
                     retry_wait = float(retry_after)
                 except (TypeError, ValueError):
                     retry_wait = 15.0
-
                 retry_wait = max(10.0, min(retry_wait, 60.0))
-
-                print(
-                    f"[WARN] GeckoTerminal 429. "
-                    f"Waiting {retry_wait:.0f}s..."
-                )
+                print(f"[WARN] GeckoTerminal 429. Waiting {retry_wait:.0f}s...")
                 time.sleep(retry_wait)
                 continue
 
@@ -649,11 +573,9 @@ def get_json(path: str, params: dict[str, Any] | None = None):
         except requests.RequestException as exc:
             if attempt == MAX_RETRIES - 1:
                 raise
-
             retry_wait = 10.0 * (attempt + 1)
             print(
-                f"[WARN] API error: {exc}. "
-                f"Retrying in {retry_wait:.0f}s..."
+                f"[WARN] API error: {exc}. Retrying in {retry_wait:.0f}s..."
             )
             time.sleep(retry_wait)
 
@@ -662,13 +584,8 @@ def get_json(path: str, params: dict[str, Any] | None = None):
 
 def tx_count(transactions: dict[str, Any], key: str) -> int:
     value = transactions.get(key) or {}
-
     if isinstance(value, dict):
-        return (
-            int(value.get("buys", 0) or 0)
-            + int(value.get("sells", 0) or 0)
-        )
-
+        return int(value.get("buys", 0) or 0) + int(value.get("sells", 0) or 0)
     try:
         return int(value or 0)
     except Exception:
@@ -680,32 +597,16 @@ def parse_pool(item: dict[str, Any], source_type: str) -> dict[str, Any]:
     relationships = item.get("relationships") or {}
 
     pool_id = item.get("id", "")
+    address = attributes.get("address") or pool_id.split("_", 1)[-1]
 
-    address = (
-        attributes.get("address")
-        or pool_id.split("_", 1)[-1]
-    )
-
-    base_data = (
-        relationships.get("base_token", {}).get("data") or {}
-    )
-
-    quote_data = (
-        relationships.get("quote_token", {}).get("data") or {}
-    )
-
-    dex_data = (
-        relationships.get("dex", {}).get("data") or {}
-    )
+    base_data = relationships.get("base_token", {}).get("data") or {}
+    quote_data = relationships.get("quote_token", {}).get("data") or {}
+    dex_data = relationships.get("dex", {}).get("data") or {}
 
     base_id = base_data.get("id") or ""
     quote_id = quote_data.get("id") or ""
 
-    token_address = (
-        base_id.split("_", 1)[1]
-        if "_" in base_id
-        else None
-    )
+    token_address = base_id.split("_", 1)[1] if "_" in base_id else None
 
     tx = attributes.get("transactions") or {}
     volume = attributes.get("volume_usd") or {}
@@ -733,64 +634,89 @@ def parse_pool(item: dict[str, Any], source_type: str) -> dict[str, Any]:
 
 
 def discover_candidates() -> list[dict[str, Any]]:
+    """Broad, deduplicated discovery across all configured Solana DEX sources."""
+    if DEX_SCAN_MODE == "all":
+        dex_ids = SOLANA_DEX_IDS
+    else:
+        wanted = {x.strip() for x in DEX_SCAN_MODE.split(",") if x.strip()}
+        dex_ids = [x for x in SOLANA_DEX_IDS if x in wanted]
+
+    if not dex_ids:
+        raise RuntimeError("DEX_SCAN_MODE selected no configured DEXs")
+
+    print("[INFO] BROAD Solana pool discovery: " + ", ".join(dex_ids))
     print(
-        "[INFO] Scanning selected Solana DEX pool sources only: "
-        + ", ".join(SOLANA_DEX_IDS)
-    )
-    print(
-        f"[INFO] Max {DEX_PAGES_PER_SOURCE} page(s) per DEX; "
-        "no all-Solana pool crawl; NO MAXIMUM AGE."
+        f"[INFO] Up to {DEX_PAGES_PER_SOURCE} pages/DEX, "
+        f"up to {MAX_DISCOVERED_POOLS} unique pools."
     )
 
-    seen = set()
+    seen: set[str] = set()
     selected: list[dict[str, Any]] = []
 
-    for dex_id in SOLANA_DEX_IDS:
+    for dex_id in dex_ids:
         endpoint = f"/networks/{NETWORK}/dexes/{dex_id}/pools"
-        params = {
-            "include": "base_token,quote_token,dex",
-            "sort": "h24_volume_usd_desc",
-        }
-
-        print(f"[INFO] DEX: {dex_id}")
+        empty_pages = 0
+        dex_added = 0
+        print(f"[INFO] DEX DISCOVERY: {dex_id}")
 
         for page in range(1, DEX_PAGES_PER_SOURCE + 1):
+            if len(selected) >= MAX_DISCOVERED_POOLS:
+                break
+
             try:
                 payload = get_json(
                     endpoint,
-                    {**params, "page": page},
+                    {
+                        "include": "base_token,quote_token,dex",
+                        "sort": "h24_volume_usd_desc",
+                        "page": page,
+                    },
                 )
             except Exception as exc:
-                print(
-                    f"[WARN] {dex_id}: stopped at page {page}: {exc}"
-                )
+                print(f"[WARN] {dex_id}: stopped at page {page}: {exc}")
                 break
 
             data = payload.get("data", []) or []
-            if not data:
-                break
 
+            if not data:
+                empty_pages += 1
+                if empty_pages >= MAX_EMPTY_PAGES_PER_DEX:
+                    break
+                continue
+
+            empty_pages = 0
             added = 0
+
             for item in data:
                 parsed = parse_pool(item, dex_id.upper())
                 address = parsed["pool_address"]
-                if address and address not in seen:
-                    seen.add(address)
-                    selected.append(parsed)
-                    added += 1
+
+                if not address or address in seen:
+                    continue
+
+                seen.add(address)
+                selected.append(parsed)
+                added += 1
+                dex_added += 1
+
+                if len(selected) >= MAX_DISCOVERED_POOLS:
+                    break
 
             print(
-                f"[INFO] {dex_id}: page {page} "
-                f"({len(data)} pools, {added} new)"
+                f"[INFO] {dex_id}: page {page} | returned {len(data)} | "
+                f"new {added} | total unique {len(selected)}"
             )
 
-            if len(data) < 20:
+            if len(data) < POOL_PAGE_SIZE:
                 break
 
-    print(
-        f"[INFO] Selected DEX pool candidates: {len(selected)} "
-        f"(from {len(SOLANA_DEX_IDS)} DEX sources)"
-    )
+        print(f"[INFO] {dex_id}: discovered {dex_added} unique pools")
+
+        if len(selected) >= MAX_DISCOVERED_POOLS:
+            print(f"[INFO] Discovery cap reached: {MAX_DISCOVERED_POOLS}")
+            break
+
+    print(f"[INFO] TOTAL UNIQUE POOLS DISCOVERED: {len(selected)}")
     return selected
 
 
@@ -800,8 +726,7 @@ def discover_candidates() -> list[dict[str, Any]]:
 
 def get_15m_candles(pool_address: str):
     payload = get_json(
-        f"/networks/{NETWORK}/pools/"
-        f"{quote(pool_address, safe='')}/ohlcv/minute",
+        f"/networks/{NETWORK}/pools/{quote(pool_address, safe='')}/ohlcv/minute",
         {
             "aggregate": 15,
             "limit": 97,
@@ -827,52 +752,37 @@ def get_15m_candles(pool_address: str):
         except Exception:
             continue
 
+        open_price = safe_float(row[1])
         close = safe_float(row[4])
 
-        if close and close > 0:
-            rows.append((timestamp, close))
+        if open_price and open_price > 0 and close and close > 0:
+            rows.append((timestamp, open_price, close))
 
     rows.sort(key=lambda x: x[0])
     return rows
 
 
-def nearest_change(
-    rows,
-    target_seconds: int,
-    min_seconds: int,
-    max_seconds: int,
-):
+def nearest_change(rows, target_seconds: int, min_seconds: int, max_seconds: int):
     if len(rows) < 2:
         return None
 
-    latest_ts, latest_price = rows[-1]
+    latest_ts, _, latest_price = rows[-1]
     choices = []
 
-    for timestamp, old_price in rows[:-1]:
+    for timestamp, _, old_price in rows[:-1]:
         elapsed = latest_ts - timestamp
-
         if not min_seconds <= elapsed <= max_seconds:
             continue
 
         change = pct_change(latest_price, old_price)
-
-        if change is None:
-            continue
-
-        choices.append(
-            (
-                abs(elapsed - target_seconds),
-                change,
-                elapsed,
-            )
-        )
+        if change is not None:
+            choices.append((abs(elapsed - target_seconds), change, elapsed))
 
     if not choices:
         return None
 
     choices.sort(key=lambda x: x[0])
     _, change, elapsed = choices[0]
-
     return change, elapsed
 
 
@@ -880,45 +790,19 @@ def best_down(rows, min_seconds: int, max_seconds: int):
     if len(rows) < 2:
         return None
 
-    latest_ts, latest_price = rows[-1]
+    latest_ts, _, latest_price = rows[-1]
     best = None
 
-    for timestamp, old_price in rows[:-1]:
+    for timestamp, _, old_price in rows[:-1]:
         elapsed = latest_ts - timestamp
-
         if not min_seconds <= elapsed <= max_seconds:
             continue
 
         change = pct_change(latest_price, old_price)
-
         if change is None:
             continue
 
         if best is None or change < best[0]:
-            best = (change, elapsed)
-
-    return best
-
-
-def best_up(rows, min_seconds: int, max_seconds: int):
-    if len(rows) < 2:
-        return None
-
-    latest_ts, latest_price = rows[-1]
-    best = None
-
-    for timestamp, old_price in rows[:-1]:
-        elapsed = latest_ts - timestamp
-
-        if not min_seconds <= elapsed <= max_seconds:
-            continue
-
-        change = pct_change(latest_price, old_price)
-
-        if change is None:
-            continue
-
-        if best is None or change > best[0]:
             best = (change, elapsed)
 
     return best
@@ -929,22 +813,58 @@ def observed_24h_high(rows):
         return None, None
 
     latest_ts = rows[-1][0]
-
-    recent = [
-        x for x in rows
-        if latest_ts - x[0] <= 86400
-    ]
-
+    recent = [x for x in rows if latest_ts - x[0] <= 86400]
     if not recent:
         recent = rows
 
-    high = max(price for _, price in recent)
-    high_ts = max(
-        ts for ts, price in recent
-        if price == high
-    )
-
+    high = max(close for _, _, close in recent)
+    high_ts = max(ts for ts, _, close in recent if close == high)
     return high, high_ts
+
+
+def current_candle_is_red(rows) -> bool:
+    """True only when the latest 15m candle is meaningfully red."""
+    if not rows:
+        return False
+    _, open_price, close = rows[-1]
+    change = pct_change(close, open_price)
+    return change is not None and change <= -MIN_RED_CANDLE_PERCENT
+
+
+def recent_low_rebound_percent(rows, window_seconds: int = 3600) -> float | None:
+    """How far current price has rebounded above the recent lowest close."""
+    if len(rows) < 2:
+        return None
+    latest_ts, _, latest_price = rows[-1]
+    recent = [
+        close for ts, _, close in rows
+        if 0 <= latest_ts - ts <= window_seconds
+    ]
+    if not recent:
+        return None
+    low = min(recent)
+    if low <= 0:
+        return None
+    return ((latest_price - low) / low) * 100.0
+
+
+def current_candle_change(rows) -> float | None:
+    if not rows:
+        return None
+    _, open_price, close = rows[-1]
+    return pct_change(close, open_price)
+
+
+def dip_zone(drawdown_24h: float | None) -> str | None:
+    if drawdown_24h is None or drawdown_24h < MIN_DIP_ALERT:
+        return None
+    if drawdown_24h >= ULTRA_DIP_ALERT:
+        return "DIP_99+"
+    if drawdown_24h >= EXTREME_DIP_ALERT:
+        return "DIP_90+"
+    if drawdown_24h >= DEEP_DIP_ALERT:
+        return "DIP_50+"
+    return "DIP_30+"
 
 
 # =========================
@@ -952,31 +872,27 @@ def observed_24h_high(rows):
 # =========================
 
 def build_alert_key(
-    change_15m,
-    change_1h,
-    down_24h,
-    drawdown_24h,
-    up_1h,
+    current_red: bool,
+    drawdown_24h: float | None,
+    rebound_from_recent_low: float | None,
 ):
-    """Only -30% or worse dips and strictly >100% pumps alert."""
-    levels = []
+    """
+    ONLY alert on an active red dip.
+    Green/recovery/historical drops cannot trigger.
+    """
+    if not current_red:
+        return None
 
-    if change_15m is not None and change_15m <= -30.0:
-        levels.append("DIP_15M_30")
+    if drawdown_24h is None or drawdown_24h < MIN_DIP_ALERT:
+        return None
 
-    if change_1h is not None and change_1h <= -30.0:
-        levels.append("DIP_1H_30")
+    if (
+        rebound_from_recent_low is not None
+        and rebound_from_recent_low > MAX_REBOUND_FROM_RECENT_LOW_PERCENT
+    ):
+        return None
 
-    if down_24h is not None and down_24h <= -30.0:
-        levels.append("DIP_24H_30")
-
-    if drawdown_24h is not None and drawdown_24h >= 30.0:
-        levels.append("DIP_30")
-
-    if up_1h is not None and up_1h > 100.0:
-        levels.append("PUMP100+")
-
-    return "+".join(levels) if levels else None
+    return dip_zone(drawdown_24h)
 
 
 # =========================
@@ -988,10 +904,7 @@ def send_telegram(message: str) -> bool:
         print("\n[TELEGRAM NOT CONFIGURED]\n" + message)
         return False
 
-    url = (
-        "https://api.telegram.org/bot"
-        f"{TELEGRAM_BOT_TOKEN}/sendMessage"
-    )
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
     try:
         response = requests.post(
@@ -1006,8 +919,7 @@ def send_telegram(message: str) -> bool:
 
         if not response.ok:
             print(
-                f"[WARN] Telegram: "
-                f"{response.status_code} "
+                f"[WARN] Telegram: {response.status_code} "
                 f"{response.text[:300]}"
             )
             return False
@@ -1023,17 +935,9 @@ def send_telegram(message: str) -> bool:
 # DATABASE WRITE
 # =========================
 
-def save_scan(
-    conn,
-    p,
-    change_15m,
-    change_1h,
-    drawdown_24h,
-    result,
-):
+def save_scan(conn, p, change_15m, change_1h, drawdown_24h, result):
     created = p.get("pool_created_at")
     age_hours = None
-
     if created:
         age_hours = max(0, (now_ts() - created) / 3600)
 
@@ -1063,7 +967,6 @@ def save_scan(
             result,
         ),
     )
-
     conn.commit()
 
 
@@ -1077,10 +980,7 @@ def update_pool(
     alert_key,
     alert_sent,
 ):
-    old_key, old_ts = previous_alert(
-        conn,
-        p["pool_address"],
-    )
+    old_key, old_ts = previous_alert(conn, p["pool_address"])
 
     last_key = alert_key if alert_sent else old_key
     last_ts = now_ts() if alert_sent else old_ts
@@ -1124,7 +1024,6 @@ def update_pool(
             last_ts,
         ),
     )
-
     conn.commit()
 
 
@@ -1136,75 +1035,58 @@ def alert_message(
     p,
     change_15m,
     change_1h,
-    down_24h,
+    candle_change,
     drawdown_24h,
     high_24h,
-    up_1h,
+    rebound_from_recent_low,
     alert_key,
 ):
-    title = "🚨 SOLANA DIP RADAR"
-
-    if "PUMP100+" in alert_key and "DIP_" not in alert_key:
-        title = "🚀 SOLANA PUMP ALERT"
-
-    metadata_value = p.get("metadata_mutable")
-    metadata_text = (
-        "YES" if metadata_value is True
-        else "NO" if metadata_value is False
-        else "UNKNOWN"
-    )
-
-    mint_authority = p.get("mint_authority")
-    mint_text = "REVOKED" if mint_authority is None else "ACTIVE"
+    zone_names = {
+        "DIP_30+": "🔴 DIP -30%+",
+        "DIP_50+": "🔴 DEEP DIP -50%+",
+        "DIP_90+": "💀 EXTREME CRASH -90%+",
+        "DIP_99+": "💀💀 EXTREME CRASH -99%+",
+    }
 
     lines = [
-        title,
+        "🚨 SOLANA ACTIVE RED DIP",
         "",
         f"Token: {p['symbol'] or 'UNKNOWN'}",
         f"Type: {p['source_type']}",
         f"Pool age: {format_age(p['pool_created_at'])}",
         f"Price: {fmt_usd(p['price'])}",
         "",
+        "CANDLE: 🔴 RED — ACTIVE FALL",
     ]
 
+    if candle_change is not None:
+        lines.append(f"Current 15m candle: {candle_change:+.2f}%")
+
     if change_15m is not None:
-        lines.append(f"15m: {change_15m:+.2f}%")
+        lines.append(f"15m vs prior: {change_15m:+.2f}%")
 
     if change_1h is not None:
         lines.append(f"1h: {change_1h:+.2f}%")
 
-    if down_24h:
-        lines.append(
-            f"Best 1h-24h drop: "
-            f"{down_24h[0]:+.2f}% "
-            f"in {format_duration(down_24h[1])}"
-        )
-
-    if high_24h:
-        lines.append(f"24h high: {fmt_usd(high_24h)}")
+    if high_24h is not None:
+        lines.append(f"Observed 24h high: {fmt_usd(high_24h)}")
 
     if drawdown_24h is not None:
-        lines.append(
-            f"Below 24h high: {drawdown_24h:.2f}%"
-        )
+        lines.append(f"Current drawdown: -{drawdown_24h:.2f}%")
 
-    if up_1h:
+    if rebound_from_recent_low is not None:
         lines.append(
-            f"Best 1h-24h rise: "
-            f"{up_1h[0]:+.2f}% "
-            f"in {format_duration(up_1h[1])}"
+            f"Rebound from recent low: +{rebound_from_recent_low:.2f}%"
         )
 
     lines += [
+        "",
+        f"ZONE: {zone_names.get(alert_key, alert_key)}",
         "",
         f"Liquidity: {fmt_usd(p['liquidity'])}",
         f"24h volume: {fmt_usd(p['volume_24h'])}",
         f"24h transactions: {p['tx_24h']}",
         f"DEX: {p['dex'] or 'unknown'}",
-        "Dev holdings: NOT CHECKED",
-        "Metadata mutable: NOT CHECKED",
-        "Mint authority: NOT CHECKED",
-        f"Signal: {alert_key}",
         "",
         f"Mint: {p['token_address'] or 'unknown'}",
         f"Pool: {p['pool_address']}",
@@ -1223,32 +1105,29 @@ def alert_message(
 def scan():
     conn = init_db()
 
-    started = datetime.now(
-        timezone.utc
-    ).astimezone().isoformat(
+    started = datetime.now(timezone.utc).astimezone().isoformat(
         timespec="seconds"
     )
 
     print("")
     print("=" * 72)
-    print("SOLANA DIP RADAR v5")
+    print("SOLANA DIP RADAR v6 — BROAD ACTIVE RED DIP RADAR")
     print(f"Started: {started}")
-    print("SOLANA POOLS: SELECTED DEX SOURCES ONLY / MAX 20 POOLS")
     print("MINIMUM POOL AGE: >= 48 HOURS")
     print("NO MAXIMUM AGE")
-    print("MAX ANALYZED POOLS: 20")
-    print("LIQUIDITY FILTER: NONE")
-    print("24H VOLUME FILTER: NONE")
-    print("24H TRANSACTION FILTER: NONE")
-    print("CUSTOM TOKEN SAFETY VERIFICATION: NOT REQUIRED")
-    print("METADATA IMMUTABILITY: NOT REQUIRED")
-    print("DIP ALERT: -30% OR WORSE ONLY")
-    print("PUMP ALERT: STRICTLY ABOVE +100% ONLY")
-    print("NO OTHER PRICE MOVEMENTS ALERT")
+    print(f"MAX DISCOVERED POOLS: {MAX_DISCOVERED_POOLS}")
+    print(f"MAX ANALYZED POOLS: {MAX_ANALYZED_POOLS}")
+    print(f"DEX PAGES PER SOURCE: {DEX_PAGES_PER_SOURCE}")
+    print("BROAD POOL DISCOVERY: ENABLED")
+    print("DIP ALERT: CURRENT PRICE >= 30% BELOW OBSERVED 24H HIGH")
+    print("CURRENT CANDLE MUST BE RED")
+    print("GREEN CANDLE: NEVER ALERT")
+    print("RECOVERY: NEVER ALERT")
+    print("HISTORICAL BEST DROP: NEVER AN ALERT TRIGGER")
+    print("PUMP ALERTS: DISABLED")
     print("=" * 72)
 
     candidates = discover_candidates()
-
     print(f"\nPools discovered: {len(candidates)}")
 
     source_counts = {}
@@ -1258,12 +1137,8 @@ def scan():
 
     print(
         "Sources: "
-        + " | ".join(
-            f"{k}: {v}"
-            for k, v in sorted(source_counts.items())
-        )
+        + " | ".join(f"{k}: {v}" for k, v in sorted(source_counts.items()))
     )
-
     print(
         f"API spacing: {REQUEST_INTERVAL:.1f}s "
         "(deliberately slow to reduce 429 errors)"
@@ -1271,6 +1146,9 @@ def scan():
     print("")
 
     analyzed_count = 0
+    red_count = 0
+    green_ignored_count = 0
+    recovery_ignored_count = 0
 
     for index, p in enumerate(candidates, start=1):
         if analyzed_count >= MAX_ANALYZED_POOLS:
@@ -1284,8 +1162,8 @@ def scan():
 
             if not created_at:
                 print(
-                    f"[{index:04d}] {name} | "
-                    f"{p['source_type']} | age unknown | FILTERED"
+                    f"[{index:04d}] {name} | {p['source_type']} | "
+                    "age unknown | FILTERED"
                 )
                 continue
 
@@ -1293,9 +1171,8 @@ def scan():
 
             if age_days < MIN_POOL_AGE_DAYS:
                 print(
-                    f"[{index:04d}] {name} | "
-                    f"{p['source_type']} | too new "
-                    f"({age_days * 24:.1f}h < 48h)"
+                    f"[{index:04d}] {name} | {p['source_type']} | "
+                    f"too new ({age_days * 24:.1f}h < 48h)"
                 )
                 continue
 
@@ -1303,20 +1180,13 @@ def scan():
                 print(f"[{index:04d}] {name} | NO PRICE")
                 continue
 
-            # Liquidity, volume and transaction count are intentionally
-            # NOT used as filters in this version.
-
             if not p["token_address"]:
                 print(
-                    f"[{index:04d}] {name} | "
-                    "missing token address | FILTERED"
+                    f"[{index:04d}] {name} | missing token address | FILTERED"
                 )
                 continue
 
-            # Diagnostic mode: do NOT require the custom safety-check
-            # / "verified pool" gate. This lets eligible pools reach
-            # OHLCV and alert evaluation so we can identify the real
-            # Telegram-alert bottleneck.
+            # Diagnostic mode preserved: safety gate is not required.
             p["dev_holding_percent"] = None
             p["metadata_mutable"] = None
             p["mint_authority"] = None
@@ -1324,54 +1194,25 @@ def scan():
             rows = get_15m_candles(p["pool_address"])
 
             if len(rows) < 5:
-                print(
-                    f"[{index:04d}] {name} | "
-                    "not enough candles"
-                )
+                print(f"[{index:04d}] {name} | not enough candles")
                 continue
 
             analyzed_count += 1
 
-            
-            print(
-                f"[ANALYZED {analyzed_count:02d}/{MAX_ANALYZED_POOLS}] "
-                f"{name} | {p['source_type']} | "
-                f"age {format_age(p['pool_created_at'])} | "
-                f"tx24h {p['tx_24h']} | "
-                f"liq {fmt_usd(p['liquidity'])}"
-            )
-
-            latest_price = rows[-1][1]
+            latest_price = rows[-1][2]
             p["price"] = latest_price
 
             change_15m_data = nearest_change(
                 rows, 15 * 60, 10 * 60, 25 * 60
             )
-
             change_1h_data = nearest_change(
                 rows, 60 * 60, 45 * 60, 90 * 60
             )
 
-            down_24h = best_down(
-                rows, 60 * 60, 24 * 60 * 60
-            )
-
-            up_1h = best_up(
-                rows, 60 * 60, 24 * 60 * 60
-            )
-
-            change_15m = (
-                change_15m_data[0]
-                if change_15m_data else None
-            )
-
-            change_1h = (
-                change_1h_data[0]
-                if change_1h_data else None
-            )
+            change_15m = change_15m_data[0] if change_15m_data else None
+            change_1h = change_1h_data[0] if change_1h_data else None
 
             high_24h, _ = observed_24h_high(rows)
-
             drawdown_24h = None
 
             if high_24h and high_24h > 0:
@@ -1380,26 +1221,54 @@ def scan():
                     (1.0 - latest_price / high_24h) * 100.0,
                 )
 
-            up_value = up_1h[0] if up_1h else None
+            current_red = current_candle_is_red(rows)
+            candle_change = current_candle_change(rows)
+            rebound_from_recent_low = recent_low_rebound_percent(rows, 3600)
 
+            print(
+                f"[ANALYZED {analyzed_count:02d}/{MAX_ANALYZED_POOLS}] "
+                f"{name} | {p['source_type']} | "
+                f"age {format_age(p['pool_created_at'])} | "
+                f"15m candle "
+                f"{'🔴 RED' if current_red else '🟢 GREEN'} "
+                f"{candle_change:+.2f}% if available | "
+                f"drawdown {drawdown_24h:.2f}%"
+                if candle_change is not None and drawdown_24h is not None
+                else
+                f"[ANALYZED {analyzed_count:02d}/{MAX_ANALYZED_POOLS}] "
+                f"{name} | {p['source_type']}"
+            )
+
+            # THE ONLY ALERT DECISION
             alert_key = build_alert_key(
-                change_15m,
-                change_1h,
-                down_24h[0] if down_24h else None,
+                current_red,
                 drawdown_24h,
-                up_value,
+                rebound_from_recent_low,
             )
 
             if not alert_key:
+                if not current_red:
+                    green_ignored_count += 1
+                    result = "GREEN_IGNORED"
+                elif (
+                    rebound_from_recent_low is not None
+                    and rebound_from_recent_low > MAX_REBOUND_FROM_RECENT_LOW_PERCENT
+                ):
+                    recovery_ignored_count += 1
+                    result = "RECOVERY_IGNORED"
+                else:
+                    result = "NO_DIP_30"
+
                 save_scan(
                     conn,
                     p,
                     change_15m,
                     change_1h,
                     drawdown_24h,
-                    "NO_ALERT",
+                    result,
                 )
 
+                # A green/recovery state does NOT create an alert.
                 update_pool(
                     conn,
                     p,
@@ -1410,43 +1279,24 @@ def scan():
                     None,
                     False,
                 )
+
+                if not current_red:
+                    print(
+                        f"       ↳ 🟢 GREEN/RECOVERY — NO ALERT"
+                    )
                 continue
 
-            if change_15m is not None:
+            red_count += 1
+            print(
+                f"       ↳ 🚨 RED DIP SIGNAL: {alert_key} | "
+                f"candle {candle_change:+.2f}% | "
+                f"drawdown -{drawdown_24h:.2f}%"
+            )
+
+            if not alert_allowed(conn, p["pool_address"], alert_key):
                 print(
-                    f"[{index:04d}] 🚨 ALERT | "
-                    f"{name} / {p['source_type']} | "
-                    f"15m {change_15m:+.2f}%",
-                    end="",
+                    f"       ↳ {alert_key} already alerted recently"
                 )
-            else:
-                print(
-                    f"[{index:04d}] 🚨 ALERT | "
-                    f"{name} / {p['source_type']} | 15m n/a",
-                    end="",
-                )
-
-            if change_1h is not None:
-                print(f" | 1h {change_1h:+.2f}%", end="")
-
-            if drawdown_24h is not None:
-                print(
-                    f" | 24hHigh↓ {drawdown_24h:.2f}%",
-                    end="",
-                )
-
-            print()
-
-            if not alert_allowed(
-                conn,
-                p["pool_address"],
-                alert_key,
-            ):
-                print(
-                    f"       ↳ {alert_key} "
-                    "already alerted recently"
-                )
-
                 update_pool(
                     conn,
                     p,
@@ -1463,10 +1313,10 @@ def scan():
                 p,
                 change_15m,
                 change_1h,
-                down_24h,
+                candle_change,
                 drawdown_24h,
                 high_24h,
-                up_1h,
+                rebound_from_recent_low,
                 alert_key,
             )
 
@@ -1494,11 +1344,10 @@ def scan():
                 f"{type(exc).__name__}: {exc}"
             )
 
-    print(
-        f"\nPools fully analyzed: "
-        f"{analyzed_count}/{MAX_ANALYZED_POOLS}"
-    )
-
+    print(f"\nPools fully analyzed: {analyzed_count}/{MAX_ANALYZED_POOLS}")
+    print(f"Red qualifying signals: {red_count}")
+    print(f"Green candles ignored: {green_ignored_count}")
+    print(f"Recoveries ignored: {recovery_ignored_count}")
     conn.close()
 
     print("")
