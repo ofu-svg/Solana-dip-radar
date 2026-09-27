@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-SOLANA DIP RADAR v5 — 48H TO 7D / 20 VERIFIED POOLS MAX
+SOLANA DIP RADAR v4 — 48H / 20 VERIFIED POOLS MAX
 
 Rules:
 - Minimum pool age: 48 hours.
-- Maximum pool age: 7 days.
+- No maximum age.
 - Maximum of 20 fully verified pools are analyzed.
-- Only selected Solana DEX pool venues are scanned.
-- No all-Solana crawling.
+- Paginate through all Solana pools available from GeckoTerminal.
 - Dip alerts: -30% or worse only.
 - Pump alerts: strictly above +100% only.
 - Dev/team holding must be <= 5%.
@@ -55,11 +54,10 @@ REQUIRE_METADATA_IMMUTABLE = (
     os.getenv("REQUIRE_METADATA_IMMUTABLE", "true").lower() == "true"
 )
 
-# Pool age window: 48 hours through 7 days.
+# Pool age: minimum 48 hours. NO maximum age.
 MIN_POOL_AGE_DAYS = float(os.getenv("MIN_POOL_AGE_DAYS", "2"))
-MAX_POOL_AGE_DAYS = float(os.getenv("MAX_POOL_AGE_DAYS", "7"))
 
-# Only scan selected real Solana DEX pool venues.
+# Only selected real Solana DEX pool venues.
 # Phantom is a wallet/trading interface and DEXTools is an analytics platform,
 # so neither is treated as a pool venue here.
 SOLANA_DEX_IDS = [
@@ -72,7 +70,7 @@ SOLANA_DEX_IDS = [
     "pumpswap",
 ]
 
-# Keep discovery small enough to avoid the 494-pool crawl that caused 429s.
+# Discovery is deliberately bounded to reduce GeckoTerminal 429s.
 DEX_PAGES_PER_SOURCE = int(os.getenv("DEX_PAGES_PER_SOURCE", "3"))
 MAX_VERIFIED_POOLS = 20  # HARD CAP: never fully analyze more than 20 verified pools
 
@@ -90,9 +88,7 @@ EXTREME_DIP_24H = 95.0
 ULTRA_DIP_24H = 99.0
 
 REQUEST_INTERVAL = float(os.getenv("REQUEST_INTERVAL", "6.5"))
-MAX_RETRIES = 4
-SOLANA_RPC_INTERVAL = float(os.getenv("SOLANA_RPC_INTERVAL", "1.25"))
-SOLANA_RPC_MAX_RETRIES = 5
+MAX_RETRIES = 3
 ALERT_COOLDOWN_HOURS = float(os.getenv("ALERT_COOLDOWN_HOURS", "12"))
 
 DB_PATH = os.getenv("DB_PATH", "solana_dip_radar_v3.sqlite3")
@@ -116,7 +112,6 @@ solana_session.headers.update({
 })
 
 _last_gt_request = 0.0
-_last_solana_rpc_request = 0.0
 
 
 # =========================
@@ -194,61 +189,22 @@ def format_duration(seconds: int) -> str:
 # =========================
 
 def solana_rpc(method: str, params: list[Any]) -> Any:
-    global _last_solana_rpc_request
-
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": method,
         "params": params,
     }
-
-    for attempt in range(SOLANA_RPC_MAX_RETRIES):
-        wait = SOLANA_RPC_INTERVAL - (
-            time.monotonic() - _last_solana_rpc_request
-        )
-        if wait > 0:
-            time.sleep(wait)
-
-        try:
-            _last_solana_rpc_request = time.monotonic()
-            response = solana_session.post(
-                SOLANA_RPC_URL,
-                json=payload,
-                timeout=30,
-            )
-
-            if response.status_code == 429:
-                retry_after = response.headers.get("Retry-After")
-                try:
-                    retry_wait = float(retry_after)
-                except (TypeError, ValueError):
-                    retry_wait = min(30.0, 3.0 * (attempt + 1))
-                retry_wait = max(2.0, min(retry_wait, 60.0))
-                print(
-                    f"[WARN] Solana RPC 429 on {method}. "
-                    f"Waiting {retry_wait:.0f}s..."
-                )
-                time.sleep(retry_wait)
-                continue
-
-            response.raise_for_status()
-            data = response.json()
-            if data.get("error"):
-                raise RuntimeError(f"Solana RPC {method}: {data['error']}")
-            return data.get("result")
-
-        except requests.RequestException as exc:
-            if attempt >= SOLANA_RPC_MAX_RETRIES - 1:
-                raise
-            retry_wait = min(30.0, 2.0 * (attempt + 1))
-            print(
-                f"[WARN] Solana RPC error on {method}: {exc}. "
-                f"Retrying in {retry_wait:.0f}s..."
-            )
-            time.sleep(retry_wait)
-
-    raise RuntimeError(f"Solana RPC {method} failed after retries")
+    response = solana_session.post(
+        SOLANA_RPC_URL,
+        json=payload,
+        timeout=30,
+    )
+    response.raise_for_status()
+    data = response.json()
+    if data.get("error"):
+        raise RuntimeError(f"Solana RPC {method}: {data['error']}")
+    return data.get("result")
 
 
 def get_mint_info(mint: str) -> dict[str, Any]:
@@ -805,11 +761,11 @@ def discover_all_pools(
 
 
 def discover_candidates() -> list[dict[str, Any]]:
-    """Discover only pools from selected Solana DEX venues.
+    """Discover pools only from selected Solana DEX venues.
 
-    We deliberately do NOT crawl /new_pools, /pools, or /trending_pools
-    across the entire Solana network. That was the source of the 494-pool
-    crawl and repeated 429 errors.
+    We deliberately do NOT crawl the entire Solana network.
+    Pools older than 7 days are allowed; only pools younger than 48 hours
+    are rejected later during the hard age filter.
     """
     print(
         "[INFO] Scanning selected Solana DEX pool sources only: "
@@ -817,7 +773,7 @@ def discover_candidates() -> list[dict[str, Any]]:
     )
     print(
         f"[INFO] Max {DEX_PAGES_PER_SOURCE} page(s) per DEX; "
-        "no all-Solana pool crawl."
+        "no all-Solana pool crawl; NO MAXIMUM AGE."
     )
 
     seen = set()
@@ -1311,7 +1267,7 @@ def scan():
     print(f"Started: {started}")
     print("SOLANA POOLS: SELECTED DEX SOURCES ONLY / MAX 20 VERIFIED POOLS")
     print("MINIMUM POOL AGE: >= 48 HOURS")
-    print("MAXIMUM POOL AGE: <= 7 DAYS")
+    print("NO MAXIMUM AGE")
     print("MAX VERIFIED POOLS: 20")
     print(f"MINIMUM 24H TRANSACTIONS: {MIN_TX_24H}")
     print("DEV HOLDING FILTER: <= 5% REQUIRED")
@@ -1373,14 +1329,6 @@ def scan():
                     f"[{index:04d}] {name} | "
                     f"{p['source_type']} | too new "
                     f"({age_days * 24:.1f}h < 48h)"
-                )
-                continue
-
-            if age_days > MAX_POOL_AGE_DAYS:
-                print(
-                    f"[{index:04d}] {name} | "
-                    f"{p['source_type']} | too old "
-                    f"({age_days:.1f}d > 7d)"
                 )
                 continue
 
