@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SOLANA DIP RADAR v6.1 — FAST BROAD ACTIVE RED DIP RADAR
+SOLANA DIP RADAR v6.2 — RATE-LIMIT SAFE RED-ONLY RADAR
 
 Core alert rule:
 - Track eligible Solana pools continuously during each scan.
@@ -70,9 +70,9 @@ SOLANA_DEX_IDS = [
     "pumpswap",
 ]
 
-DEX_PAGES_PER_SOURCE = int(os.getenv("DEX_PAGES_PER_SOURCE", "5"))
-MAX_DISCOVERED_POOLS = int(os.getenv("MAX_DISCOVERED_POOLS", "700"))
-MAX_ANALYZED_POOLS = int(os.getenv("MAX_ANALYZED_POOLS", "60"))
+DEX_PAGES_PER_SOURCE = int(os.getenv("DEX_PAGES_PER_SOURCE", "4"))
+MAX_DISCOVERED_POOLS = int(os.getenv("MAX_DISCOVERED_POOLS", "500"))
+MAX_ANALYZED_POOLS = int(os.getenv("MAX_ANALYZED_POOLS", "40"))
 POOL_PAGE_SIZE = int(os.getenv("POOL_PAGE_SIZE", "20"))
 MAX_EMPTY_PAGES_PER_DEX = int(os.getenv("MAX_EMPTY_PAGES_PER_DEX", "2"))
 DEX_SCAN_MODE = os.getenv("DEX_SCAN_MODE", "all").strip().lower()
@@ -91,8 +91,8 @@ DEEP_DIP_ALERT = 50.0
 EXTREME_DIP_ALERT = 90.0
 ULTRA_DIP_ALERT = 99.0
 
-REQUEST_INTERVAL = float(os.getenv("REQUEST_INTERVAL", "2.5"))
-MAX_RETRIES = 2
+REQUEST_INTERVAL = float(os.getenv("REQUEST_INTERVAL", "3.5"))
+MAX_RETRIES = 1
 ALERT_COOLDOWN_HOURS = float(os.getenv("ALERT_COOLDOWN_HOURS", "12"))
 
 DB_PATH = os.getenv("DB_PATH", "solana_dip_radar_v3.sqlite3")
@@ -570,7 +570,7 @@ def get_json(path: str, params: dict[str, Any] | None = None):
                 except (TypeError, ValueError):
                     retry_wait = 15.0
                 retry_wait = max(5.0, min(retry_wait, 20.0))
-                print(f"[WARN] GeckoTerminal 429. Waiting {retry_wait:.0f}s...")
+                print(f"[WARN] GeckoTerminal 429. Waiting {retry_wait:.0f}s (single retry)...")
                 time.sleep(retry_wait)
                 continue
 
@@ -1121,9 +1121,10 @@ def scan():
     print("SOLANA DIP RADAR v6 — BROAD ACTIVE RED DIP RADAR")
     print(f"Started: {started}")
     print("MINIMUM POOL AGE: >= 48 HOURS")
-    print("FAST MODE: LIMITED DISCOVERY + LIMITED OHLCV REQUESTS")
+    print("RATE-LIMIT SAFE MODE: LIMITED DISCOVERY + LIMITED OHLCV REQUESTS")
     print("NO MAXIMUM AGE")
     print(f"MAX DISCOVERED POOLS: {MAX_DISCOVERED_POOLS}")
+    print("IMPORTANT: This run never scans 1000+ pools sequentially.")
     print(f"MAX ANALYZED POOLS: {MAX_ANALYZED_POOLS}")
     print(f"DEX PAGES PER SOURCE: {DEX_PAGES_PER_SOURCE}")
     print(f"REQUEST INTERVAL: {REQUEST_INTERVAL:.1f}s")
