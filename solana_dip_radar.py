@@ -91,8 +91,8 @@ DEEP_DIP_ALERT = 60.0
 EXTREME_DIP_ALERT = 90.0
 ULTRA_DIP_ALERT = 99.0
 
-REQUEST_INTERVAL = float(os.getenv("REQUEST_INTERVAL", "5.0"))
-MAX_RETRIES = 3
+REQUEST_INTERVAL = float(os.getenv("REQUEST_INTERVAL", "3.5"))
+MAX_RETRIES = 2
 ALERT_COOLDOWN_HOURS = float(os.getenv("ALERT_COOLDOWN_HOURS", "12"))
 
 DB_PATH = os.getenv("DB_PATH", "solana_dip_radar_v3.sqlite3")
