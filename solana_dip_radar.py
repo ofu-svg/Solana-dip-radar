@@ -5,7 +5,7 @@ SOLANA DIP RADAR v6.2 — RATE-LIMIT SAFE RED-ONLY RADAR
 Core alert rule:
 - Track eligible Solana pools continuously during each scan.
 - Alert only when the CURRENT 15-minute candle is RED (close < open).
-- Alert only when the current price is >=30% below the observed 24h high.
+- Alert only when the current price is >=40% below the observed 24h high.
 - Zones: -40%, -60%, -90%, -99%+.
 - NEVER alert on a green candle.
 - NEVER alert merely because an old/historical drop occurred.
