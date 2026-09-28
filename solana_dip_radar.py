@@ -1265,7 +1265,7 @@ def scan():
                     recovery_ignored_count += 1
                     result = "RECOVERY_IGNORED"
                 else:
-                    result = "NO_DIP_30"
+                    result = "NO_DIP_40"
 
                 save_scan(
                     conn,
