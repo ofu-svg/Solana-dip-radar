@@ -6,7 +6,7 @@ Core alert rule:
 - Track eligible Solana pools continuously during each scan.
 - Alert only when the CURRENT 15-minute candle is RED (close < open).
 - Alert only when the current price is >=30% below the observed 24h high.
-- Zones: -30%, -50%, -90%, -99%+.
+- Zones: -40%, -60%, -90%, -99%+.
 - NEVER alert on a green candle.
 - NEVER alert merely because an old/historical drop occurred.
 - NEVER send pump alerts.
@@ -86,8 +86,8 @@ MIN_VOLUME_24H = 0.0
 MIN_TX_24H = 0
 
 # ACTIVE DIP ALERTS
-MIN_DIP_ALERT = 30.0
-DEEP_DIP_ALERT = 50.0
+MIN_DIP_ALERT = 40.0
+DEEP_DIP_ALERT = 60.0
 EXTREME_DIP_ALERT = 90.0
 ULTRA_DIP_ALERT = 99.0
 
