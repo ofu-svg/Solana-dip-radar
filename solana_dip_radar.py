@@ -1049,12 +1049,11 @@ def alert_message(
     alert_key,
 ):
     zone_names = {
-        "DIP_30+": "🔴 DIP -30%+",
-        "DIP_50+": "🔴 DEEP DIP -50%+",
-        "DIP_90+": "💀 EXTREME CRASH -90%+",
-        "DIP_99+": "💀💀 EXTREME CRASH -99%+",
-    }
-
+    "DIP_40+": "🔴 DIP -40%+",
+    "DIP_60+": "🔴 DEEP DIP -60%+",
+    "DIP_90+": "💀 EXTREME CRASH -90%+",
+    "DIP_99+": "💀💀 EXTREME CRASH -99%+",
+}
     lines = [
         "🚨 SOLANA ACTIVE RED DIP",
         "",
