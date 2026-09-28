@@ -1116,7 +1116,7 @@ def scan():
 
     print("")
     print("=" * 72)
-    print("SOLANA DIP RADAR v6 — BROAD ACTIVE RED DIP RADAR")
+    print("SOLANA DIP RADAR v6.2 — RATE-LIMIT SAFE RED-ONLY RADAR")
     print(f"Started: {started}")
     print("MINIMUM POOL AGE: >= 48 HOURS")
     print("RATE-LIMIT SAFE MODE: LIMITED DISCOVERY + LIMITED OHLCV REQUESTS")
