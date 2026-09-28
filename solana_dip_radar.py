@@ -870,8 +870,8 @@ def dip_zone(drawdown_24h: float | None) -> str | None:
     if drawdown_24h >= EXTREME_DIP_ALERT:
         return "DIP_90+"
     if drawdown_24h >= DEEP_DIP_ALERT:
-        return "DIP_50+"
-    return "DIP_30+"
+    return "DIP_60+"
+    return "DIP_40+"
 
 
 # =========================
