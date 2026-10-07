@@ -5,8 +5,8 @@ SOLANA DIP RADAR v6.2 — RATE-LIMIT SAFE RED-ONLY RADAR
 Core alert rule:
 - Track eligible Solana pools continuously during each scan.
 - Alert only when the CURRENT 15-minute candle is RED (close < open).
-- Alert only when the current price is >=40% below the observed 24h high.
-- Zones: -40%, -60%, -90%, -99%+.
+- Alert only when the current price is >=80% below the observed 24h high.
+- Zones: -80%, -98%, -99%, -99.9%+.
 - NEVER alert on a green candle.
 - NEVER alert merely because an old/historical drop occurred.
 - NEVER send pump alerts.
@@ -38,7 +38,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Make GitHub Actions show scanner output immediately instead of buffering it.
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
@@ -86,10 +85,10 @@ MIN_VOLUME_24H = 0.0
 MIN_TX_24H = 0
 
 # ACTIVE DIP ALERTS
-MIN_DIP_ALERT = 40.0
-DEEP_DIP_ALERT = 60.0
-EXTREME_DIP_ALERT = 90.0
-ULTRA_DIP_ALERT = 99.0
+MIN_DIP_ALERT = 80.0
+DEEP_DIP_ALERT = 98.0
+EXTREME_DIP_ALERT = 99.0
+ULTRA_DIP_ALERT = 99.9
 
 REQUEST_INTERVAL = float(os.getenv("REQUEST_INTERVAL", "3.5"))
 MAX_RETRIES = 2
@@ -866,12 +865,27 @@ def dip_zone(drawdown_24h: float | None) -> str | None:
     if drawdown_24h is None or drawdown_24h < MIN_DIP_ALERT:
         return None
     if drawdown_24h >= ULTRA_DIP_ALERT:
-        return "DIP_99+"
+        return "DIP_99_9+"
     if drawdown_24h >= EXTREME_DIP_ALERT:
-        return "DIP_90+"
+        return "DIP_99+"
     if drawdown_24h >= DEEP_DIP_ALERT:
-        return "DIP_60+"
-    return "DIP_40+"
+        return "DIP_98+"
+    return "DIP_80+"
+
+
+def high_to_current_multiple(
+    current_price: float | None,
+    high_price: float | None,
+) -> float | None:
+    if (
+        current_price is None
+        or high_price is None
+        or current_price <= 0
+        or high_price <= 0
+    ):
+        return None
+    return high_price / current_price
+
 
 # =========================
 # ALERT LOGIC
@@ -1048,11 +1062,12 @@ def alert_message(
     alert_key,
 ):
     zone_names = {
-    "DIP_40+": "🔴 DIP -40%+",
-    "DIP_60+": "🔴 DEEP DIP -60%+",
-    "DIP_90+": "💀 EXTREME CRASH -90%+",
-    "DIP_99+": "💀💀 EXTREME CRASH -99%+",
-}
+        "DIP_80+": "🔴 DIP — 80%+",
+        "DIP_98+": "💀 EXTREME CRASH — 98%+",
+        "DIP_99+": "💀💀 EXTREME CRASH — 99%+",
+        "DIP_99_9+": "⚠️ NEAR-ZERO / CATASTROPHIC — 99.9%+",
+    }
+
     lines = [
         "🚨 SOLANA ACTIVE RED DIP",
         "",
@@ -1078,6 +1093,15 @@ def alert_message(
 
     if drawdown_24h is not None:
         lines.append(f"Current drawdown: -{drawdown_24h:.2f}%")
+
+    multiple = high_to_current_multiple(p["price"], high_24h)
+    if multiple is not None:
+        if multiple >= 1000:
+            lines.append(f"High / current price: {multiple:,.0f}x")
+        elif multiple >= 100:
+            lines.append(f"High / current price: {multiple:,.1f}x")
+        else:
+            lines.append(f"High / current price: {multiple:.2f}x")
 
     if rebound_from_recent_low is not None:
         lines.append(
@@ -1127,7 +1151,7 @@ def scan():
     print(f"DEX PAGES PER SOURCE: {DEX_PAGES_PER_SOURCE}")
     print(f"REQUEST INTERVAL: {REQUEST_INTERVAL:.1f}s")
     print("BROAD POOL DISCOVERY: ENABLED (FAST PAGINATED MODE)")
-    print("DIP ALERT: CURRENT PRICE >= 40% BELOW OBSERVED 24H HIGH")
+    print("DIP ALERT: CURRENT PRICE >= 80% BELOW OBSERVED 24H HIGH")
     print("CURRENT CANDLE MUST BE RED")
     print("GREEN CANDLE: NEVER ALERT")
     print("RECOVERY: NEVER ALERT")
@@ -1193,7 +1217,6 @@ def scan():
                 )
                 continue
 
-            # Diagnostic mode preserved: safety gate is not required.
             p["dev_holding_percent"] = None
             p["metadata_mutable"] = None
             p["mint_authority"] = None
@@ -1232,19 +1255,21 @@ def scan():
             candle_change = current_candle_change(rows)
             rebound_from_recent_low = recent_low_rebound_percent(rows, 3600)
 
-            print(
-                f"[ANALYZED {analyzed_count:02d}/{MAX_ANALYZED_POOLS}] "
-                f"{name} | {p['source_type']} | "
-                f"age {format_age(p['pool_created_at'])} | "
-                f"15m candle "
-                f"{'🔴 RED' if current_red else '🟢 GREEN'} "
-                f"{candle_change:+.2f}% if available | "
-                f"drawdown {drawdown_24h:.2f}%"
-                if candle_change is not None and drawdown_24h is not None
-                else
-                f"[ANALYZED {analyzed_count:02d}/{MAX_ANALYZED_POOLS}] "
-                f"{name} | {p['source_type']}"
-            )
+            if candle_change is not None and drawdown_24h is not None:
+                print(
+                    f"[ANALYZED {analyzed_count:02d}/{MAX_ANALYZED_POOLS}] "
+                    f"{name} | {p['source_type']} | "
+                    f"age {format_age(p['pool_created_at'])} | "
+                    f"15m candle "
+                    f"{'🔴 RED' if current_red else '🟢 GREEN'} "
+                    f"{candle_change:+.2f}% | "
+                    f"drawdown {drawdown_24h:.2f}%"
+                )
+            else:
+                print(
+                    f"[ANALYZED {analyzed_count:02d}/{MAX_ANALYZED_POOLS}] "
+                    f"{name} | {p['source_type']}"
+                )
 
             # THE ONLY ALERT DECISION
             alert_key = build_alert_key(
@@ -1264,7 +1289,7 @@ def scan():
                     recovery_ignored_count += 1
                     result = "RECOVERY_IGNORED"
                 else:
-                    result = "NO_DIP_40"
+                    result = "BELOW_80_NO_ALERT"
 
                 save_scan(
                     conn,
@@ -1275,7 +1300,6 @@ def scan():
                     result,
                 )
 
-                # A green/recovery state does NOT create an alert.
                 update_pool(
                     conn,
                     p,
@@ -1289,7 +1313,7 @@ def scan():
 
                 if not current_red:
                     print(
-                        f"       ↳ 🟢 GREEN/RECOVERY — NO ALERT"
+                        "       ↳ 🟢 GREEN/RECOVERY — NO ALERT"
                     )
                 continue
 
